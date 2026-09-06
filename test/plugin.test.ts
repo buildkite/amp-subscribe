@@ -10,6 +10,7 @@ import ampSubscribe, {
   GitHubEventCoalescer,
   instrumentPullRequestCreate,
   pullRequestFromCreateOutput,
+  readPullRequestCIState,
 } from "../plugin/subscribe"
 
 describe("bridgeConfiguration", () => {
@@ -162,13 +163,14 @@ type CapturedAppendUserMessage = (
 async function captureWebhookHandler(
   appendUserMessage: CapturedAppendUserMessage = async () => undefined,
   stateGet: () => Promise<string> = async () => "running",
+  shell: PluginAPI["$"] = async () => ({ exitCode: 0, stdout: "amp-user\n", stderr: "" }),
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
   const previousOrb = process.env.AMP_ORB
   process.env.AMP_ORB = "1"
   try {
     await ampSubscribe({
-      $: async () => ({ exitCode: 0, stdout: "amp-user\n", stderr: "" }),
+      $: shell,
       logger: { log: () => undefined },
       createWebhook: async (options: { handler: CapturedWebhookHandler }) => {
         handler = options.handler
@@ -600,6 +602,35 @@ describe("webhook handler delivery", () => {
     const results = await Promise.allSettled([first, duplicate])
     expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"])
   })
+
+  test("checks live aggregate PR state before appending a success", async () => {
+    const messages: unknown[] = []
+    const handler = await captureWebhookHandler(
+      async (_threadID, message) => { messages.push(message) },
+      undefined,
+      async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          headRefOid: "a".repeat(40),
+          statusCheckRollup: [
+            { __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" },
+            { __typename: "StatusContext", state: "SUCCESS" },
+          ],
+        }),
+        stderr: "",
+      }),
+    )
+    const invocation = webhookInvocation("successful-pr-ci")
+    invocation.event.body = new TextEncoder().encode(JSON.stringify({
+      ...checkEvent("check_run", 200, "completed", "success"),
+      targetThreadID: "T-target-thread",
+    }))
+
+    await handler(invocation.event, invocation.context)
+
+    expect(messages).toHaveLength(1)
+    expect(JSON.stringify(messages[0])).toContain("All 2 reported checks passed")
+  })
 })
 
 function checkEvent(
@@ -626,6 +657,43 @@ function checkEvent(
     },
   }
 }
+
+describe("readPullRequestCIState", () => {
+  test("reads the live head and aggregate check state from GitHub", async () => {
+    const response = (statusCheckRollup: unknown[]) => ({
+      $: async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({ headRefOid: "b".repeat(40), statusCheckRollup }),
+        stderr: "",
+      }),
+    }) as unknown as PluginAPI
+
+    expect(await readPullRequestCIState(response([
+      { __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" },
+      { __typename: "CheckRun", status: "COMPLETED", conclusion: "SKIPPED" },
+      { __typename: "StatusContext", state: "SUCCESS" },
+    ]), checkEvent("check_run", 1, "completed", "success"))).toEqual({
+      headSha: "b".repeat(40),
+      state: "success",
+      checkCount: 3,
+    })
+    expect((await readPullRequestCIState(response([
+      { __typename: "CheckRun", status: "IN_PROGRESS", conclusion: null },
+    ]), checkEvent("check_run", 2, "completed", "success")))?.state).toBe("pending")
+    expect((await readPullRequestCIState(response([
+      { __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" },
+      { __typename: "StatusContext", state: "PENDING" },
+    ]), checkEvent("check_run", 3, "completed", "failure")))?.state).toBe("failure")
+  })
+
+  test("retries rather than consuming a success when GitHub cannot provide aggregate state", async () => {
+    const amp = {
+      $: async () => ({ exitCode: 1, stdout: "", stderr: "not found" }),
+    } as unknown as PluginAPI
+    await expect(readPullRequestCIState(amp, checkEvent("check_run", 1, "completed", "success")))
+      .rejects.toThrow("Could not read current CI")
+  })
+})
 
 describe("GitHubEventCoalescer", () => {
   test("suppresses lifecycle noise, semantic duplicates, stale SHAs, and PR edits", async () => {
@@ -679,29 +747,49 @@ describe("GitHubEventCoalescer", () => {
     expect(deliveries).toHaveLength(beforeBaseEdit + 1)
   })
 
-  test("debounces current-head successes and removes suite overlap without hiding workflows", async () => {
+  test("delivers one aggregate success only when live PR checks pass on the event head", async () => {
     const coalescer = new GitHubEventCoalescer(5, 10, 50)
     const deliveries: Array<{ content: string; urgent: boolean; reason: string }> = []
     const deliver = async (delivery: (typeof deliveries)[number]) => { deliveries.push(delivery) }
-    const successes = [
-      checkEvent("check_suite", 10, "completed", "success", { appSlug: "github-actions" }),
-      checkEvent("workflow_run", 11, "completed", "success"),
-      checkEvent("check_run", 12, "completed", "success", { appSlug: "github-actions" }),
-      checkEvent("check_run", 13, "completed", "success", { appSlug: "github-actions" }),
-    ]
-    await Promise.all(successes.map((event) => coalescer.handle(event, deliver)))
+    expect((await coalescer.handle(
+      checkEvent("check_run", 10, "completed", "success"),
+      deliver,
+      undefined,
+      { headSha: "a".repeat(40), state: "pending", checkCount: 4 },
+    )).suppressed).toBe("pull request CI not successful")
+    expect((await coalescer.handle(
+      checkEvent("check_run", 11, "completed", "success", { headSha: "b".repeat(40) }),
+      deliver,
+      undefined,
+      { headSha: "a".repeat(40), state: "success", checkCount: 4 },
+    )).suppressed).toBe("stale check for superseded head")
+    await coalescer.handle(
+      checkEvent("check_run", 12, "completed", "success"),
+      deliver,
+      undefined,
+      { headSha: "a".repeat(40), state: "success", checkCount: 4 },
+    )
+    expect((await coalescer.handle(
+      checkEvent("workflow_run", 13, "completed", "success"),
+      deliver,
+      undefined,
+      { headSha: "a".repeat(40), state: "success", checkCount: 4 },
+    )).suppressed).toBe("pull request CI success already delivered")
     expect(deliveries).toHaveLength(1)
-    expect(deliveries[0]).toMatchObject({ urgent: false, reason: "CI success batch" })
-    expect(deliveries[0]?.content).toContain("Check run 12: success")
-    expect(deliveries[0]?.content).toContain("Check run 13: success")
-    expect(deliveries[0]?.content).not.toContain("Check suite 10")
-    expect(deliveries[0]?.content).toContain("Workflow run 11: success")
+    expect(deliveries[0]).toMatchObject({ urgent: false, reason: "pull request CI successful" })
+    expect(deliveries[0]?.content).toContain("All 4 reported checks passed")
+    expect(deliveries[0]?.content).not.toContain("individual check results")
   })
 
-  test("coalesces duplicate terminal suites with different delivery IDs", async () => {
+  test("coalesces duplicate terminal suites for branch subscriptions", async () => {
     const coalescer = new GitHubEventCoalescer(5, 10, 50)
     const deliveries: string[] = []
-    const suite = checkEvent("check_suite", 20, "completed", "success", { appSlug: "socket-security" })
+    const suite = {
+      ...checkEvent("check_suite", 20, "completed", "success", { appSlug: "socket-security" }),
+      targetType: "branch",
+      pullRequest: undefined,
+      branch: { name: "main", url: "https://github.com/lox/project/tree/main" },
+    }
     await Promise.all([
       coalescer.handle(suite, async (delivery) => { deliveries.push(delivery.content) }),
       coalescer.handle(
@@ -884,8 +972,14 @@ describe("GitHubEventCoalescer", () => {
 
   test("rejects every contributor when appending a batch fails and permits retry", async () => {
     const coalescer = new GitHubEventCoalescer(5, 10, 50)
-    const first = checkEvent("check_run", 250, "completed", "success")
-    const second = checkEvent("check_run", 251, "completed", "success")
+    const onBranch = (event: ReturnType<typeof checkEvent>) => ({
+      ...event,
+      targetType: "branch",
+      pullRequest: undefined,
+      branch: { name: "main", url: "https://github.com/lox/project/tree/main" },
+    })
+    const first = onBranch(checkEvent("check_run", 250, "completed", "success"))
+    const second = onBranch(checkEvent("check_run", 251, "completed", "success"))
     const failing = async () => { throw new Error("append failed") }
     const results = await Promise.allSettled([
       coalescer.handle(first, failing),
@@ -929,31 +1023,6 @@ describe("GitHubEventCoalescer", () => {
       newHeadCheckDelivered = true
     })
     expect(newHeadCheckDelivered).toBe(true)
-  })
-
-  test("settles a pending success batch as suppressed when the head advances", async () => {
-    const coalescer = new GitHubEventCoalescer(5, 30, 50)
-    const deliveries: string[] = []
-    const deliver = async (delivery: { content: string }) => { deliveries.push(delivery.content) }
-    const pending = coalescer.handle(checkEvent("check_run", 350, "completed", "success"), deliver)
-    await Bun.sleep(5)
-    const update = {
-      ...baseEvent,
-      deliveryId: "new-head",
-      githubEvent: "pull_request",
-      event: "commits",
-      action: "synchronize",
-      detail: {
-        kind: "pull_request",
-        beforeSha: "a".repeat(40),
-        afterSha: "b".repeat(40),
-        headSha: "b".repeat(40),
-      },
-    }
-    await coalescer.handle(update, deliver)
-    expect((await pending).suppressed).toBe("stale check batch for superseded head")
-    expect(deliveries).toHaveLength(1)
-    expect(deliveries[0]).toContain("Pull request updated")
   })
 
   test("supersedes pending and later stale checks when a branch advances", async () => {

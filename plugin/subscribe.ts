@@ -695,6 +695,79 @@ function batchPrompt(events: PendingEvent[], heading: string): string {
   ].join("\n")
 }
 
+export interface PullRequestCIState {
+  headSha: string
+  state: "pending" | "failure" | "success"
+  checkCount: number
+}
+
+function pullRequestCISuccessPrompt(value: unknown, metadata: JsonObject, ci: PullRequestCIState): string {
+  const repository = object(metadata.repository)!
+  const pullRequest = object(metadata.pullRequest)!
+  const fullName = text(repository, "fullName")!
+  const number = positiveInteger(pullRequest.number)!
+  return [
+    "GitHub current-head CI successful:",
+    `All ${ci.checkCount} reported checks passed on ${fullName}#${number}.`,
+    `Commit: ${ci.headSha.slice(0, 12)}.`,
+    `PR: https://github.com/${fullName}/pull/${number}`,
+    behaviorInstruction([value]),
+  ].join("\n")
+}
+
+export async function readPullRequestCIState(amp: PluginAPI, value: unknown): Promise<PullRequestCIState | null> {
+  const payload = object(value)
+  if (!payload) throw new Error("Rejected malformed GitHub event")
+  const metadata = promptMetadata(payload)
+  if (text(metadata, "targetType") !== "pull_request") return null
+  const repository = object(metadata.repository)!
+  const pullRequest = object(metadata.pullRequest)!
+  const fullName = text(repository, "fullName")!
+  const number = positiveInteger(pullRequest.number)!
+  const result = await amp.$`gh pr view ${number} --repo ${fullName} --json headRefOid,statusCheckRollup`
+  if (result.exitCode !== 0) throw new Error(`Could not read current CI for ${fullName}#${number}`)
+
+  let response: JsonObject | null
+  try {
+    response = object(JSON.parse(result.stdout))
+  } catch {
+    throw new Error(`Could not parse current CI for ${fullName}#${number}`)
+  }
+  const headSha = sha(response?.headRefOid)
+  const checks = response?.statusCheckRollup
+  if (!headSha || !Array.isArray(checks) || checks.length === 0) {
+    throw new Error(`GitHub returned no current CI for ${fullName}#${number}`)
+  }
+
+  let pending = false
+  let failed = false
+  for (const value of checks) {
+    const check = object(value)
+    if (!check) {
+      pending = true
+      continue
+    }
+    if (check.__typename === "CheckRun") {
+      const status = text(check, "status")
+      const conclusion = text(check, "conclusion")
+      if (status !== "COMPLETED" || !conclusion) pending = true
+      else if (conclusion !== "SUCCESS" && conclusion !== "NEUTRAL" && conclusion !== "SKIPPED") failed = true
+    } else if (check.__typename === "StatusContext") {
+      const state = text(check, "state")
+      if (state === "PENDING" || state === "EXPECTED" || !state) pending = true
+      else if (state !== "SUCCESS") failed = true
+    } else {
+      pending = true
+    }
+  }
+
+  return {
+    headSha,
+    state: failed ? "failure" : pending ? "pending" : "success",
+    checkCount: checks.length,
+  }
+}
+
 function isCheckDetail(detail: JsonObject | null): boolean {
   const kind = detail && text(detail, "kind")
   return kind === "check_run" || kind === "check_suite" || kind === "workflow_run"
@@ -750,6 +823,7 @@ function waitUntilOrCompletion(
 export class GitHubEventCoalescer {
   private readonly currentHeads = new Map<string, string>()
   private readonly supersededHeads = new Map<string, Set<string>>()
+  private readonly successfulPullRequestHeads = new Set<string>()
   private readonly seen = new Map<string, number>()
   private readonly pendingSignatures = new Map<string, Promise<unknown>>()
   private readonly batches = new Map<string, PendingBatch>()
@@ -765,6 +839,7 @@ export class GitHubEventCoalescer {
     value: unknown,
     deliver: (delivery: CoalescedDelivery) => Promise<void>,
     signal?: AbortSignal,
+    pullRequestCI?: PullRequestCIState | null,
   ): Promise<CoalescingResult> {
     const payload = object(value)
     if (!payload) throw new Error("Rejected malformed GitHub event")
@@ -840,6 +915,30 @@ export class GitHubEventCoalescer {
       if (!successful) {
         const delivery = { content: eventPrompt(value), urgent: true, reason: "terminal check failure" }
         return this.deliver(signature, delivery, deliver)
+      }
+
+      if (text(metadata, "targetType") === "pull_request") {
+        if (!pullRequestCI) return suppress("could not verify pull request CI")
+        if (headSha && headSha !== pullRequestCI.headSha) return suppress("stale check for superseded head")
+        if (pullRequestCI.state !== "success") return suppress("pull request CI not successful")
+        const successfulHead = `${target}:${pullRequestCI.headSha}`
+        if (this.successfulPullRequestHeads.has(successfulHead)) {
+          return suppress("pull request CI success already delivered")
+        }
+        this.successfulPullRequestHeads.add(successfulHead)
+        if (this.successfulPullRequestHeads.size > 2_000) {
+          this.successfulPullRequestHeads.delete(this.successfulPullRequestHeads.values().next().value!)
+        }
+        try {
+          return await this.deliver(signature, {
+            content: pullRequestCISuccessPrompt(value, metadata, pullRequestCI),
+            urgent: false,
+            reason: "pull request CI successful",
+          }, deliver)
+        } catch (error) {
+          this.successfulPullRequestHeads.delete(successfulHead)
+          throw error
+        }
       }
 
       return this.enqueue(
@@ -1073,6 +1172,16 @@ export default async function ampSubscribe(amp: PluginAPI) {
             ...counters,
           })
         } else {
+          const parsedPayload = object(payload)
+          if (!parsedPayload) throw new Error("Rejected malformed GitHub event")
+          const metadata = promptMetadata(parsedPayload)
+          const detail = object(metadata.detail)
+          const pullRequestCI = text(metadata, "targetType") === "pull_request"
+            && isCheckDetail(detail)
+            && text(detail!, "status") === "completed"
+            && ["success", "neutral", "skipped"].includes(text(detail!, "conclusion") ?? "")
+            ? await readPullRequestCIState(amp, payload)
+            : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
             await targetThread.appendUserMessage(
               { type: "user-message", content: delivery.content },
@@ -1086,7 +1195,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
               eventId: event.id,
               ...counters,
             })
-          }, ctx.signal)
+          }, ctx.signal, pullRequestCI)
           if (result.suppressed) {
             counters.suppressed += 1
             ctx.logger.log("GitHub event suppressed", { reason: result.suppressed, eventId: event.id, ...counters })
