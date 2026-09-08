@@ -131,9 +131,17 @@ replies without steering active work, and suppresses pull request body/title edi
 logs include delivery reasons, steering decisions, and cumulative received/delivered/suppressed/
 batched counts.
 
-GitHub delivery IDs are deduplicated durably by the bridge. Thread-side batching and semantic
-deduplication are process-local; as with any at-least-once handler, a process loss immediately after
-appending a message can still produce a duplicate when Amp retries the event.
+GitHub delivery IDs are deduplicated durably by the bridge. Thread-side batching and the short
+semantic event cache are process-local. Before appending a GitHub message, the plugin also reads the
+target thread's recent transcript and suppresses an exact content match among user messages after
+the latest assistant message. This catches a retry or restarted handler when the same generated
+message is already stacked for the agent, while allowing changed check or review details and an
+update that the agent previously handled. The read covers the 20 most recent user/assistant
+messages, the maximum supported by one plugin API call.
+
+This pending-message check is entirely plugin-side; it does not change the bridge payload or API.
+Deploying the bridge is therefore unnecessary, and mixed installations are safe while the updated
+`subscribe.ts` plugin rolls out.
 
 ## Self-hosting
 

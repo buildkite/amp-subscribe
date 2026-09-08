@@ -9,6 +9,7 @@ import ampSubscribe, {
   feedPrompt,
   GitHubEventCoalescer,
   instrumentPullRequestCreate,
+  PendingThreadDeliveryDeduplicator,
   pullRequestFromCreateOutput,
   readPullRequestCIState,
 } from "../plugin/subscribe"
@@ -164,6 +165,7 @@ async function captureWebhookHandler(
   appendUserMessage: CapturedAppendUserMessage = async () => undefined,
   stateGet: () => Promise<string> = async () => "running",
   shell: PluginAPI["$"] = async () => ({ exitCode: 0, stdout: "amp-user\n", stderr: "" }),
+  messages: (threadID: string) => Promise<unknown[]> = async () => [],
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
   const previousOrb = process.env.AMP_ORB
@@ -181,6 +183,7 @@ async function captureWebhookHandler(
           id: threadID,
           appendUserMessage: (message: unknown, options: { steer?: boolean }) =>
             appendUserMessage(threadID, message, options),
+          messages: () => messages(threadID),
           state: { get: stateGet },
         }),
       },
@@ -630,6 +633,123 @@ describe("webhook handler delivery", () => {
 
     expect(messages).toHaveLength(1)
     expect(JSON.stringify(messages[0])).toContain("All 2 reported checks passed")
+  })
+
+  test("suppresses a matching GitHub message still pending after a handler restart", async () => {
+    const transcript: unknown[] = []
+    const append = async (_threadID: string, message: unknown) => {
+      const content = (message as { content: string }).content
+      transcript.push({ id: `message-${transcript.length}`, role: "user", content: [{ type: "text", text: content }] })
+    }
+    const messages = async () => transcript
+    const firstHandler = await captureWebhookHandler(append, undefined, undefined, messages)
+    const secondHandler = await captureWebhookHandler(append, undefined, undefined, messages)
+    const first = webhookInvocation("amp-event-before-restart")
+    const retry = webhookInvocation("amp-event-after-restart")
+    const retryPayload = JSON.parse(new TextDecoder().decode(retry.event.body))
+    retry.event.body = new TextEncoder().encode(JSON.stringify({
+      ...retryPayload,
+      deliveryId: "different-github-delivery",
+    }))
+
+    await firstHandler(first.event, first.context)
+    await secondHandler(retry.event, retry.context)
+
+    expect(transcript).toHaveLength(1)
+  })
+})
+
+describe("PendingThreadDeliveryDeduplicator", () => {
+  function thread(id: string, initial: Array<{ role: "user" | "assistant"; text: string }> = []) {
+    const messages = initial.map((message, index) => ({
+      id: `message-${index}`,
+      role: message.role,
+      content: [{ type: "text" as const, text: message.text }],
+    }))
+    const appended: string[] = []
+    let failNextAppend = false
+    return {
+      id,
+      messages,
+      appended,
+      failNext() { failNextAppend = true },
+      handle: {
+        id,
+        messages: async () => messages,
+        appendUserMessage: async (message: { content: string }) => {
+          if (failNextAppend) {
+            failNextAppend = false
+            throw new Error("append failed")
+          }
+          appended.push(message.content)
+          messages.push({
+            id: `message-${messages.length}`,
+            role: "user",
+            content: [{ type: "text", text: message.content }],
+          })
+        },
+      } as any,
+    }
+  }
+
+  test("suppresses exact CI summaries and review batches already pending in the thread", async () => {
+    const deduplicator = new PendingThreadDeliveryDeduplicator()
+    for (const content of [
+      "GitHub current-head CI success summary:\nCheck run 1: success",
+      "GitHub review batch:\nReview 2: changes requested",
+    ]) {
+      const target = thread("T-target", [
+        { role: "assistant", text: "Working" },
+        { role: "user", text: content },
+      ])
+      expect(await deduplicator.append(target.handle, { content, urgent: false, reason: "batch" })).toBe(false)
+      expect(target.appended).toEqual([])
+    }
+  })
+
+  test("preserves changed payloads and messages already consumed by an assistant", async () => {
+    const deduplicator = new PendingThreadDeliveryDeduplicator()
+    const pending = "GitHub review batch:\nReview 2: changes requested"
+    const changed = `${pending}\nReview comment 3`
+    const target = thread("T-target", [
+      { role: "user", text: pending },
+      { role: "assistant", text: "Handled the earlier review" },
+    ])
+
+    expect(await deduplicator.append(target.handle, { content: pending, urgent: false, reason: "review batch" })).toBe(true)
+    expect(await deduplicator.append(target.handle, { content: changed, urgent: false, reason: "review batch" })).toBe(true)
+    expect(target.appended).toEqual([pending, changed])
+  })
+
+  test("isolates threads and serializes concurrent appends without reordering distinct updates", async () => {
+    const deduplicator = new PendingThreadDeliveryDeduplicator()
+    const first = thread("T-one")
+    const second = thread("T-two")
+    const summary = "GitHub current-head CI success summary:\nCheck run 1: success"
+    const changed = `${summary}\nCheck run 2: success`
+
+    const results = await Promise.all([
+      deduplicator.append(first.handle, { content: summary, urgent: false, reason: "CI success batch" }),
+      deduplicator.append(first.handle, { content: summary, urgent: false, reason: "CI success batch" }),
+      deduplicator.append(first.handle, { content: changed, urgent: false, reason: "CI success batch" }),
+      deduplicator.append(second.handle, { content: summary, urgent: false, reason: "CI success batch" }),
+    ])
+
+    expect(results).toEqual([true, false, true, true])
+    expect(first.appended).toEqual([summary, changed])
+    expect(second.appended).toEqual([summary])
+  })
+
+  test("does not consume a failed append and permits its retry", async () => {
+    const deduplicator = new PendingThreadDeliveryDeduplicator()
+    const target = thread("T-target")
+    const content = "GitHub review batch:\nReview 2: approved"
+    target.failNext()
+
+    await expect(deduplicator.append(target.handle, { content, urgent: false, reason: "review batch" }))
+      .rejects.toThrow("append failed")
+    expect(await deduplicator.append(target.handle, { content, urgent: false, reason: "review batch" })).toBe(true)
+    expect(target.appended).toEqual([content])
   })
 })
 
