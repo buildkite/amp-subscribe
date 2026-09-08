@@ -1,4 +1,4 @@
-import type { PluginAPI, ThreadID } from "@ampcode/plugin"
+import type { PluginAPI, PluginThread, ThreadID } from "@ampcode/plugin"
 import { existsSync, readFileSync, rmSync } from "node:fs"
 
 // Keep subscribe.ts stable: Amp includes the plugin identity in durable webhook URLs.
@@ -652,6 +652,44 @@ export interface CoalescingResult {
   suppressed?: string
 }
 
+/** Serializes the transcript check and append for each target thread. */
+export class PendingThreadDeliveryDeduplicator {
+  private readonly executions = new Map<string, Promise<void>>()
+
+  async append(target: PluginThread, delivery: CoalescedDelivery): Promise<boolean> {
+    const previous = this.executions.get(target.id) ?? Promise.resolve()
+    const execution = previous.catch(() => undefined).then(async () => {
+      const messages = await target.messages({ from: "end", limit: 20, roles: ["user", "assistant"] })
+      let lastAssistant = -1
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index]?.role === "assistant") {
+          lastAssistant = index
+          break
+        }
+      }
+      const alreadyPending = messages.slice(lastAssistant + 1).some((message) =>
+        message.role === "user"
+        && message.content.length === 1
+        && message.content[0]?.type === "text"
+        && message.content[0].text === delivery.content,
+      )
+      if (alreadyPending) return false
+      await target.appendUserMessage(
+        { type: "user-message", content: delivery.content },
+        { steer: delivery.urgent },
+      )
+      return true
+    })
+    const settled = execution.then(() => undefined, () => undefined)
+    this.executions.set(target.id, settled)
+    try {
+      return await execution
+    } finally {
+      if (this.executions.get(target.id) === settled) this.executions.delete(target.id)
+    }
+  }
+}
+
 interface PendingBatch {
   key: string
   kind: PendingKind
@@ -1138,6 +1176,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
   }
   const pullRequestCreateMarkers = new Map<string, string>()
   const coalescer = new GitHubEventCoalescer()
+  const pendingDeliveries = new PendingThreadDeliveryDeduplicator()
   const seen = new Set<string>()
   const executions = new Map<string, Promise<void>>()
   const counters = { received: 0, delivered: 0, suppressed: 0, batched: 0 }
@@ -1183,10 +1222,15 @@ export default async function ampSubscribe(amp: PluginAPI) {
             ? await readPullRequestCIState(amp, payload)
             : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
-            await targetThread.appendUserMessage(
-              { type: "user-message", content: delivery.content },
-              { steer: delivery.urgent },
-            )
+            if (!await pendingDeliveries.append(targetThread, delivery)) {
+              counters.suppressed += 1
+              ctx.logger.log("GitHub event suppressed", {
+                reason: "matching message already pending in target thread",
+                eventId: event.id,
+                ...counters,
+              })
+              return
+            }
             counters.delivered += 1
             if (delivery.reason.endsWith("batch")) counters.batched += 1
             ctx.logger.log("GitHub event delivered", {
