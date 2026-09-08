@@ -5,6 +5,7 @@ import { verifyHmac } from "./crypto"
 import { SubscriptionDatabase } from "./database"
 import { normalizeGitHubEvent } from "./events"
 import { fetchFeed, type FetchedFeed } from "./feeds"
+import { MetricsRegistry } from "./metrics"
 import {
   subscriptionEvents,
   type RoutedEvent,
@@ -77,6 +78,52 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
   if (config.databasePath !== ":memory:") mkdirSync(dirname(config.databasePath), { recursive: true })
   const database = new SubscriptionDatabase(config.databasePath)
   const feedFetcher = config.fetchFeed ?? fetchFeed
+
+  const metrics = new MetricsRegistry()
+  const subscriptionTargetTypes = ["pull_request", "branch", "repository"] as const
+  const subscriptionsGauge = metrics.gauge(
+    "amp_subscribe_subscriptions",
+    "Current number of GitHub subscriptions, by target type.",
+  )
+  const feedSubscriptionsGauge = metrics.gauge(
+    "amp_subscribe_feed_subscriptions",
+    "Current number of feed subscriptions.",
+  )
+  const apiRequestsTotal = metrics.counter(
+    "amp_subscribe_api_requests_total",
+    "Subscription API requests, by route, method and response status.",
+  )
+  const webhookEventsReceivedTotal = metrics.counter(
+    "amp_subscribe_webhook_events_received_total",
+    "GitHub webhook deliveries received with a valid signature, by GitHub event type.",
+  )
+  const webhookSignatureFailuresTotal = metrics.counter(
+    "amp_subscribe_webhook_signature_failures_total",
+    "GitHub webhook deliveries rejected for an invalid HMAC signature.",
+  )
+  const webhookEventsSuppressedTotal = metrics.counter(
+    "amp_subscribe_webhook_events_suppressed_total",
+    "Normalized GitHub events suppressed before matching subscriptions, by reason.",
+  )
+  const webhookDeliveriesTotal = metrics.counter(
+    "amp_subscribe_webhook_deliveries_total",
+    "Attempts to forward a matched GitHub event to an Amp durable webhook, by outcome.",
+  )
+  const feedPollTotal = metrics.counter(
+    "amp_subscribe_feed_poll_total",
+    "Feed polling outcomes, by result.",
+  )
+  for (const outcome of ["delivered", "failed", "removed"]) webhookDeliveriesTotal.inc({ outcome }, 0)
+  for (const result of ["checked", "delivered", "failed", "removed"]) feedPollTotal.inc({ result }, 0)
+  webhookSignatureFailuresTotal.inc({}, 0)
+
+  function refreshGauges(): void {
+    const counts = new Map(database.countSubscriptionsByTargetType().map((row) => [row.targetType, row.count]))
+    for (const targetType of subscriptionTargetTypes) {
+      subscriptionsGauge.set({ target_type: targetType }, counts.get(targetType) ?? 0)
+    }
+    feedSubscriptionsGauge.set({}, database.countFeedSubscriptions())
+  }
 
   async function subscriptions(request: Request): Promise<Response> {
     const identity = await config.authenticate(request).catch(() => null)
@@ -152,10 +199,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     const body = new Uint8Array(await request.arrayBuffer())
     const signature = request.headers.get("x-hub-signature-256") ?? ""
     if (!await verifyHmac(config.githubWebhookSecret, body, signature)) {
+      webhookSignatureFailuresTotal.inc()
       return json({ error: "invalid signature" }, 401)
     }
     const eventName = request.headers.get("x-github-event") ?? ""
     const deliveryId = request.headers.get("x-github-delivery") ?? ""
+    webhookEventsReceivedTotal.inc({ event: eventName || "unknown" })
     let payload: unknown
     try {
       payload = JSON.parse(new TextDecoder().decode(body)) as unknown
@@ -163,7 +212,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       return json({ error: "invalid JSON" }, 400)
     }
     const normalizedEvents = normalizeGitHubEvent(eventName, deliveryId, payload)
-    const events = normalizedEvents.filter((event) => relaySuppressionReason(event) === null)
+    const events: RoutedEvent[] = []
+    for (const event of normalizedEvents) {
+      const reason = relaySuppressionReason(event)
+      if (reason) webhookEventsSuppressedTotal.inc({ reason })
+      else events.push(event)
+    }
     const suppressed = normalizedEvents.length - events.length
     let delivered = 0
     let failed = 0
@@ -203,19 +257,23 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
           })
         } catch {
           failed += 1
+          webhookDeliveriesTotal.inc({ outcome: "failed" })
           continue
         }
         if (response.status === 404 || response.status === 410) {
           database.delete(subscription.threadId, subscription.id)
           removed += 1
+          webhookDeliveriesTotal.inc({ outcome: "removed" })
           continue
         }
         if (!response.ok) {
           failed += 1
+          webhookDeliveriesTotal.inc({ outcome: "failed" })
           continue
         }
         database.markDelivered(subscription.id, deliveryId, event.event)
         delivered += 1
+        webhookDeliveriesTotal.inc({ outcome: "delivered" })
       }
     }
     if (failed > 0) {
@@ -290,6 +348,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     try {
       for (const subscription of database.allFeeds()) {
         checked += 1
+        feedPollTotal.inc({ result: "checked" })
         let fetched: FetchedFeed
         try {
           fetched = await feedFetcher(subscription.feedUrl, {
@@ -298,6 +357,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
           })
         } catch {
           failed += 1
+          feedPollTotal.inc({ result: "failed" })
           continue
         }
         if (!fetched.feed) continue
@@ -332,20 +392,24 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
           } catch {
             failed += 1
             feedFailed = true
+            feedPollTotal.inc({ result: "failed" })
             continue
           }
           if (response.status === 404 || response.status === 410) {
             database.deleteFeed(subscription.threadId, subscription.id)
             removed += 1
+            feedPollTotal.inc({ result: "removed" })
             break
           }
           if (!response.ok) {
             failed += 1
             feedFailed = true
+            feedPollTotal.inc({ result: "failed" })
             continue
           }
           database.storeFeedEntry(subscription.id, entry)
           delivered += 1
+          feedPollTotal.inc({ result: "delivered" })
         }
         if (!feedFailed) database.updateFeedCache(subscription.id, fetched.etag, fetched.lastModified)
       }
@@ -358,11 +422,27 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
   return {
     database,
     pollFeeds,
+    metrics(): Response {
+      refreshGauges()
+      return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } })
+    },
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url)
       if (request.method === "GET" && url.pathname === "/healthz") return json({ ok: true })
-      if (url.pathname === "/api/subscriptions") return subscriptions(request)
-      if (url.pathname === "/api/feed-subscriptions") return feedSubscriptions(request)
+      if (url.pathname === "/api/subscriptions") {
+        const response = await subscriptions(request)
+        apiRequestsTotal.inc({ route: "subscriptions", method: request.method, status: String(response.status) })
+        return response
+      }
+      if (url.pathname === "/api/feed-subscriptions") {
+        const response = await feedSubscriptions(request)
+        apiRequestsTotal.inc({
+          route: "feed-subscriptions",
+          method: request.method,
+          status: String(response.status),
+        })
+        return response
+      }
       if (request.method === "POST" && url.pathname === "/github/webhook") return githubWebhook(request)
       return json({ error: "not found" }, 404)
     },

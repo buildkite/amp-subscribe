@@ -101,6 +101,19 @@ describe("SubscriptionDatabase", () => {
     const rolledForward = new SubscriptionDatabase(path)
     expect(rolledForward.matching("lox/project", "pull_request", "18", "reviews"))
       .toHaveLength(1)
+    rolledForward.upsert({
+      threadId: "T-test",
+      repository: "lox/project",
+      targetType: "pull_request",
+      pullRequestNumber: 19,
+      webhookUrl: "https://hooks.example.test/current",
+      events: ["reviews"],
+      behavior: "investigate",
+    })
+    expect(rolledForward.countSubscriptionsByTargetType()).toContainEqual({
+      targetType: "pull_request",
+      count: 2,
+    })
     const adopted = rolledForward.upsert({
       threadId: "T-test",
       repository: "lox/project",

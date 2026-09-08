@@ -32,6 +32,18 @@ Bun.serve({
 
 console.log(`amp-subscribe listening on port ${port}`)
 
+const metricsPort = Number(process.env.METRICS_PORT ?? "9091")
+Bun.serve({
+  port: metricsPort,
+  fetch(request) {
+    const url = new URL(request.url)
+    if (request.method === "GET" && url.pathname === "/metrics") return bridge.metrics()
+    return new Response("not found", { status: 404 })
+  },
+})
+
+console.log(`amp-subscribe metrics listening on port ${metricsPort}`)
+
 const pollFeeds = () => bridge.pollFeeds().then((result) => {
   if (result.failed > 0) console.error("Feed poll completed with failures", result)
 }).catch((error) => console.error("Feed poll failed", error))

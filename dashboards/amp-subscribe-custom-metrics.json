@@ -1,0 +1,383 @@
+{
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 100,
+      "panels": [],
+      "title": "Subscriptions",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_subscriptions gauge, split by app and target_type",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "id": 1,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "amp_subscribe_subscriptions{app=~\"$app\"}",
+          "instant": true,
+          "legendFormat": "{{app}} - {{target_type}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Current subscriptions by target type",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_feed_subscriptions gauge, by app",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "amp_subscribe_feed_subscriptions{app=~\"$app\"}",
+          "instant": true,
+          "legendFormat": "{{app}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Current feed subscriptions",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 101,
+      "panels": [],
+      "title": "GitHub webhook activity",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_webhook_events_received_total, by GitHub event type",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "id": 3,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_webhook_events_received_total{app=~\"$app\"}[5m])) by (app, event)",
+          "legendFormat": "{{app}} - {{event}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Webhook events received (rate)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_webhook_signature_failures_total - should normally sit at zero; a sustained non-zero rate usually means a misconfigured GITHUB_WEBHOOK_SECRET",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 20
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "id": 4,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_webhook_signature_failures_total{app=~\"$app\"}[5m])) by (app)",
+          "legendFormat": "{{app}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Webhook signature failures (rate)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_webhook_events_suppressed_total - GitHub noise filtered before consuming Amp durable webhook capacity",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "id": 5,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_webhook_events_suppressed_total{app=~\"$app\"}[5m])) by (app, reason)",
+          "legendFormat": "{{app}} - {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Suppressed events by reason (rate)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_webhook_deliveries_total - attempts to forward a matched event to an Amp durable webhook",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "id": 6,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_webhook_deliveries_total{app=~\"$app\"}[5m])) by (app, outcome)",
+          "legendFormat": "{{app}} - {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Webhook delivery outcomes (rate)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "id": 102,
+      "panels": [],
+      "title": "Feed polling",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_feed_poll_total - runs on a timer, invisible to Fly's built-in HTTP metrics",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "id": 7,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_feed_poll_total{app=~\"$app\"}[5m])) by (app, result)",
+          "legendFormat": "{{app}} - {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Feed poll outcomes (rate)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 103,
+      "panels": [],
+      "title": "Subscription API",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus_on_fly"
+      },
+      "description": "amp_subscribe_api_requests_total - subscription management traffic, split out from webhook/health traffic on the same app",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 8,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_api_requests_total{app=~\"$app\"}[5m])) by (app, route, method, status)",
+          "legendFormat": "{{app}} - {{route}} {{method}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "API requests (rate)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": [
+    "amp-subscribe",
+    "fly"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus_on_fly"
+        },
+        "includeAll": true,
+        "label": "App",
+        "multi": true,
+        "name": "app",
+        "query": {
+          "query": "label_values(amp_subscribe_subscriptions, app)",
+          "refId": "app-variable"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "amp-subscribe custom metrics",
+  "uid": "dfx41yxf19xq8f"
+}

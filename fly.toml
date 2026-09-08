@@ -25,6 +25,10 @@ primary_region = "syd"
     method = "GET"
     path = "/healthz"
 
+[metrics]
+  port = 9091
+  path = "/metrics"
+
 [[mounts]]
   source = "relay_data"
   destination = "/data"

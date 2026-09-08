@@ -249,6 +249,19 @@ export class SubscriptionDatabase {
     return subscription
   }
 
+  countSubscriptionsByTargetType(): Array<{ targetType: string; count: number }> {
+    return this.sqlite.query<{ target_type: string; count: number }, []>(`
+      SELECT COALESCE(target_type, 'pull_request') AS target_type, COUNT(*) AS count
+      FROM subscriptions GROUP BY COALESCE(target_type, 'pull_request')
+    `).all().map((row) => ({ targetType: row.target_type, count: row.count }))
+  }
+
+  countFeedSubscriptions(): number {
+    return this.sqlite.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM feed_subscriptions",
+    ).get()?.count ?? 0
+  }
+
   list(threadId: string): Subscription[] {
     return this.sqlite.query<SubscriptionRow, [string]>(
       "SELECT * FROM subscriptions WHERE thread_id = ? ORDER BY created_at",
