@@ -44,6 +44,13 @@ Bun.serve({
 
 console.log(`amp-subscribe metrics listening on port ${metricsPort}`)
 
+// Drain persisted work on startup as well as new arrivals. The bridge prevents
+// overlapping runs; each pass is bounded so outages cannot create unbounded workers.
+const deliverGitHubEvents = () => bridge.deliverGitHubEvents()
+  .catch((error) => console.error("GitHub delivery worker failed", error))
+void deliverGitHubEvents()
+setInterval(deliverGitHubEvents, 1_000).unref()
+
 const pollFeeds = () => bridge.pollFeeds().then((result) => {
   if (result.failed > 0) console.error("Feed poll completed with failures", result)
 }).catch((error) => console.error("Feed poll failed", error))

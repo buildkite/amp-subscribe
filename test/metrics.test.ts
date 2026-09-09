@@ -106,7 +106,10 @@ describe("metrics", () => {
       body,
     }))
 
+    expect(await app.metrics().text()).toContain("amp_subscribe_pending_github_deliveries 1")
+    await app.deliverGitHubEvents()
     const text = await app.metrics().text()
+    expect(text).toContain("amp_subscribe_pending_github_deliveries 0")
     expect(text).toContain("amp_subscribe_webhook_signature_failures_total 1")
     expect(text).toContain('amp_subscribe_webhook_events_received_total{event="pull_request_review"} 1')
     expect(text).toContain('amp_subscribe_webhook_deliveries_total{outcome="delivered"} 1')

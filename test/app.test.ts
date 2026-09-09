@@ -121,7 +121,10 @@ describe("subscription bridge", () => {
     }))
 
     expect((await request()).status).toBe(202)
+    expect(forwarded).toHaveLength(0)
+    await app.deliverGitHubEvents()
     expect((await request()).status).toBe(202)
+    await app.deliverGitHubEvents()
     expect(forwarded).toHaveLength(2)
     expect(forwarded.map(({ body: forwardedBody }) => JSON.parse(forwardedBody).targetThreadID).sort())
       .toEqual(["T-thread-one", "T-thread-two"])
@@ -184,6 +187,7 @@ describe("subscription bridge", () => {
       body,
     }))
     expect(response.status).toBe(202)
+    await app.deliverGitHubEvents()
     expect(forwarded).toHaveLength(1)
     expect(forwarded[0]?.idempotencyKey).toMatch(/^delivery-branch:commits:42:branch:main:[0-9a-f-]+$/)
     expect(JSON.parse(forwarded[0]!.body)).toMatchObject({
@@ -233,6 +237,7 @@ describe("subscription bridge", () => {
       body,
     }))
     expect(response.status).toBe(202)
+    await app.deliverGitHubEvents()
     expect(forwarded).toHaveLength(1)
     expect(forwarded[0]?.idempotencyKey).toMatch(/^delivery-issue:issues:42:repository:[0-9a-f-]+$/)
     expect(JSON.parse(forwarded[0]!.body)).toMatchObject({
@@ -311,7 +316,7 @@ describe("subscription bridge", () => {
     expect(response.status).toBe(401)
   })
 
-  test.each([404, 410, 503, 202])("logs GitHub removal only for terminal webhook responses (%i)", async (status) => {
+  test.each([404, 410, 503, 202])("retains subscriptions and logs failed delivery safely (%i)", async (status) => {
     const app = bridge()
     const registration = await app.fetch(apiRequest({
       repository: "lox/project",
@@ -345,43 +350,42 @@ describe("subscription bridge", () => {
       body,
     }))
     const response = await send()
-    const removed = status === 404 || status === 410
-    expect(response.status).toBe(status === 503 ? 502 : 202)
-    expect(await response.json()).toMatchObject({ removed: removed ? 1 : 0 })
-    expect(app.database.list("T-removal")).toHaveLength(removed ? 0 : 1)
-    expect(warn).toHaveBeenCalledTimes(removed ? 1 : 0)
-    if (!removed) return
+    expect(response.status).toBe(202)
+    expect(await response.json()).toMatchObject({ queued: 1 })
+    await app.deliverGitHubEvents()
+    expect(app.database.list("T-removal")).toHaveLength(1)
+    expect(warn).toHaveBeenCalledTimes(status === 202 ? 0 : 1)
+    expect(app.database.pendingGitHubDeliveryCount()).toBe(status === 202 ? 0 : 1)
+    if (status === 202) return
 
     const line = warn.mock.calls[0]![0] as string
-    expect(JSON.parse(line)).toEqual({
+    expect(JSON.parse(line)).toMatchObject({
       level: "warn",
-      event: "subscription_removed",
+      event: "webhook_delivery_failed",
       timestamp: expect.any(String),
-      reason: "webhook_not_found_or_gone",
+      reason: "http_error",
       subscriptionId: subscription.id,
       threadId: "T-removal",
-      subscriptionCreatedAt: subscription.createdAt,
       webhookHost: "hooks.example.test",
       webhookUrlHash: "adfa88b122d5500d7af22e6c9cc2b27f0645df7af7df1a1d3c92e04830809e3e",
       httpStatus: status,
       requestId: "amp-request-123",
       flyRequestId: "fly-request-456",
       source: "github",
-      repository: "lox/project",
-      targetType: "pull_request",
-      target: "17",
       deliveryId: "delivery-removal",
-      githubEvent: "pull_request",
       subscriptionEvent: "commits",
-      action: "synchronize",
+      idempotencyKey: `delivery-removal:commits:42:17:${subscription.id}`,
+      attempt: 1,
+      nextAttemptAt: expect.any(String),
     })
     expect(line).not.toContain("secret-")
     expect(Number.isNaN(Date.parse(JSON.parse(line).timestamp))).toBe(false)
     await send()
+    await app.deliverGitHubEvents()
     expect(warn).toHaveBeenCalledTimes(1)
   })
 
-  test.each([404, 410])("logs feed removal without exposing feed or webhook credentials (%i)", async (status) => {
+  test.each([404, 410])("retains feeds for recovery without exposing credentials (%i)", async (status) => {
     const app = createSubscriptionBridge({
       ...config,
       fetchFeed: async () => ({
@@ -408,12 +412,12 @@ describe("subscription bridge", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {})
     spyOn(globalThis, "fetch").mockResolvedValue(new Response("secret-response-body", { status }))
 
-    expect(await app.pollFeeds()).toEqual({ checked: 1, delivered: 0, failed: 0, removed: 1 })
-    expect(app.database.listFeeds("T-feed-removal")).toHaveLength(0)
+    expect(await app.pollFeeds()).toEqual({ checked: 1, delivered: 0, failed: 1, removed: 0 })
+    expect(app.database.listFeeds("T-feed-removal")).toHaveLength(1)
     expect(warn).toHaveBeenCalledTimes(1)
     const line = warn.mock.calls[0]![0] as string
     expect(JSON.parse(line)).toMatchObject({
-      event: "subscription_removed",
+      event: "webhook_delivery_failed",
       subscriptionId: subscription.id,
       threadId: "T-feed-removal",
       source: "feed",
@@ -427,6 +431,9 @@ describe("subscription bridge", () => {
       entryFingerprint: "entry-fingerprint",
     })
     expect(line).not.toContain("secret-")
+    spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 202 }))
+    expect(await app.pollFeeds()).toEqual({ checked: 1, delivered: 1, failed: 0, removed: 0 })
+    expect(await app.pollFeeds()).toEqual({ checked: 1, delivered: 0, failed: 0, removed: 0 })
   })
 
   test("routes shared-webhook feed subscriptions by authenticated thread", async () => {
@@ -530,11 +537,13 @@ describe("subscription bridge", () => {
     }
 
     const queued = await send("delivery-queued", "queued", null)
-    expect(await queued.json()).toMatchObject({ matchedEvents: 0, delivered: 0, suppressed: 1 })
+    expect(await queued.json()).toMatchObject({ matchedEvents: 0, queued: 0, suppressed: 1 })
+    await app.deliverGitHubEvents()
     expect(fetchSpy).toHaveBeenCalledTimes(0)
 
     const failure = await send("delivery-failure", "completed", "failure")
-    expect(await failure.json()).toMatchObject({ matchedEvents: 1, delivered: 1, suppressed: 0 })
+    expect(await failure.json()).toMatchObject({ matchedEvents: 1, queued: 1, suppressed: 0 })
+    await app.deliverGitHubEvents()
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 })
