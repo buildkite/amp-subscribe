@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { OrbIdentity } from "./auth"
@@ -9,6 +10,7 @@ import { MetricsRegistry } from "./metrics"
 import {
   subscriptionEvents,
   type RoutedEvent,
+  type Subscription,
   type SubscriptionBehavior,
   type SubscriptionEvent,
 } from "./types"
@@ -42,6 +44,30 @@ function relaySuppressionReason(event: RoutedEvent): string | null {
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, { status })
+}
+
+function logWebhookRemoval(
+  subscription: Pick<Subscription, "id" | "threadId" | "createdAt" | "webhookUrl">,
+  response: Response,
+  details: Record<string, unknown>,
+): void {
+  // Capability URLs and response bodies can contain credentials. Log only a
+  // fingerprint and allowlisted response headers for cross-service correlation.
+  console.warn(JSON.stringify({
+    level: "warn",
+    event: "subscription_removed",
+    timestamp: new Date().toISOString(),
+    reason: "webhook_not_found_or_gone",
+    subscriptionId: subscription.id,
+    threadId: subscription.threadId,
+    subscriptionCreatedAt: subscription.createdAt,
+    webhookHost: new URL(subscription.webhookUrl).hostname,
+    webhookUrlHash: createHash("sha256").update(subscription.webhookUrl).digest("hex"),
+    httpStatus: response.status,
+    requestId: response.headers.get("x-request-id")?.slice(0, 256) ?? null,
+    flyRequestId: response.headers.get("fly-request-id")?.slice(0, 256) ?? null,
+    ...details,
+  }))
 }
 
 function isAllowedWebhookUrl(value: string, allowedHosts: string[]): boolean {
@@ -264,6 +290,16 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
           database.delete(subscription.threadId, subscription.id)
           removed += 1
           webhookDeliveriesTotal.inc({ outcome: "removed" })
+          logWebhookRemoval(subscription, response, {
+            source: "github",
+            repository: subscription.repository,
+            targetType: subscription.targetType,
+            target,
+            deliveryId,
+            githubEvent: event.githubEvent,
+            subscriptionEvent: event.event,
+            action: event.action,
+          })
           continue
         }
         if (!response.ok) {
@@ -399,6 +435,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
             database.deleteFeed(subscription.threadId, subscription.id)
             removed += 1
             feedPollTotal.inc({ result: "removed" })
+            logWebhookRemoval(subscription, response, {
+              source: "feed",
+              feedHost: new URL(subscription.feedUrl).hostname,
+              feedUrlHash: createHash("sha256").update(subscription.feedUrl).digest("hex"),
+              entryFingerprint: entry.fingerprint,
+            })
             break
           }
           if (!response.ok) {
