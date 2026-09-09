@@ -311,6 +311,124 @@ describe("subscription bridge", () => {
     expect(response.status).toBe(401)
   })
 
+  test.each([404, 410, 503, 202])("logs GitHub removal only for terminal webhook responses (%i)", async (status) => {
+    const app = bridge()
+    const registration = await app.fetch(apiRequest({
+      repository: "lox/project",
+      pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/secret-capability?token=secret-query",
+      events: ["commits"],
+      behavior: "implement",
+    }, "POST", "T-removal"))
+    const { subscription } = await registration.json() as { subscription: { id: string; createdAt: string } }
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    spyOn(globalThis, "fetch").mockResolvedValue(new Response("secret-response-body", {
+      status,
+      headers: {
+        "x-request-id": "amp-request-123",
+        "fly-request-id": "fly-request-456",
+        "set-cookie": "secret-cookie",
+      },
+    }))
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { id: 42, full_name: "lox/project" },
+      pull_request: { number: 17, html_url: "https://github.com/lox/project/pull/17" },
+    })
+    const send = async () => app.fetch(new Request("https://bridge.test/github/webhook", {
+      method: "POST",
+      headers: {
+        "x-hub-signature-256": await hmacSha256("github-secret", body),
+        "x-github-event": "pull_request",
+        "x-github-delivery": "delivery-removal",
+      },
+      body,
+    }))
+    const response = await send()
+    const removed = status === 404 || status === 410
+    expect(response.status).toBe(status === 503 ? 502 : 202)
+    expect(await response.json()).toMatchObject({ removed: removed ? 1 : 0 })
+    expect(app.database.list("T-removal")).toHaveLength(removed ? 0 : 1)
+    expect(warn).toHaveBeenCalledTimes(removed ? 1 : 0)
+    if (!removed) return
+
+    const line = warn.mock.calls[0]![0] as string
+    expect(JSON.parse(line)).toEqual({
+      level: "warn",
+      event: "subscription_removed",
+      timestamp: expect.any(String),
+      reason: "webhook_not_found_or_gone",
+      subscriptionId: subscription.id,
+      threadId: "T-removal",
+      subscriptionCreatedAt: subscription.createdAt,
+      webhookHost: "hooks.example.test",
+      webhookUrlHash: "adfa88b122d5500d7af22e6c9cc2b27f0645df7af7df1a1d3c92e04830809e3e",
+      httpStatus: status,
+      requestId: "amp-request-123",
+      flyRequestId: "fly-request-456",
+      source: "github",
+      repository: "lox/project",
+      targetType: "pull_request",
+      target: "17",
+      deliveryId: "delivery-removal",
+      githubEvent: "pull_request",
+      subscriptionEvent: "commits",
+      action: "synchronize",
+    })
+    expect(line).not.toContain("secret-")
+    expect(Number.isNaN(Date.parse(JSON.parse(line).timestamp))).toBe(false)
+    await send()
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  test.each([404, 410])("logs feed removal without exposing feed or webhook credentials (%i)", async (status) => {
+    const app = createSubscriptionBridge({
+      ...config,
+      fetchFeed: async () => ({
+        feed: {
+          title: "secret-feed-title",
+          entries: [{
+            id: "secret-entry-id", fingerprint: "entry-fingerprint", title: null,
+            url: null, publishedAt: null, updatedAt: null,
+          }],
+        },
+        etag: null,
+        lastModified: null,
+      }),
+    })
+    openBridges.push(app)
+    const subscription = app.database.upsertFeed({
+      threadId: "T-feed-removal",
+      feedUrl: "https://status.example/feed.atom?token=secret-feed-token",
+      webhookUrl: "https://hooks.example.test/secret-capability?token=secret-query",
+      behavior: "notify",
+      etag: null,
+      lastModified: null,
+    }, [])
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    spyOn(globalThis, "fetch").mockResolvedValue(new Response("secret-response-body", { status }))
+
+    expect(await app.pollFeeds()).toEqual({ checked: 1, delivered: 0, failed: 0, removed: 1 })
+    expect(app.database.listFeeds("T-feed-removal")).toHaveLength(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+    const line = warn.mock.calls[0]![0] as string
+    expect(JSON.parse(line)).toMatchObject({
+      event: "subscription_removed",
+      subscriptionId: subscription.id,
+      threadId: "T-feed-removal",
+      source: "feed",
+      httpStatus: status,
+      requestId: null,
+      flyRequestId: null,
+      webhookHost: "hooks.example.test",
+      webhookUrlHash: "adfa88b122d5500d7af22e6c9cc2b27f0645df7af7df1a1d3c92e04830809e3e",
+      feedHost: "status.example",
+      feedUrlHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      entryFingerprint: "entry-fingerprint",
+    })
+    expect(line).not.toContain("secret-")
+  })
+
   test("routes shared-webhook feed subscriptions by authenticated thread", async () => {
     const baseline = {
       id: "incident-1",
