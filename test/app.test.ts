@@ -212,7 +212,7 @@ describe("subscription bridge", () => {
   test("routes and deduplicates shared-webhook GitHub subscriptions by authenticated thread", async () => {
     const app = bridge()
     const info = spyOn(console, "info").mockImplementation(() => {})
-    for (const threadID of ["T-thread-one", "T-thread-two"]) {
+    for (const [threadID, deliveryMode] of [["T-thread-one", "queue"], ["T-thread-two", "steer"]] as const) {
       await app.fetch(apiRequest({
         targetThreadID: "T-attacker-controlled",
         repository: "lox/project",
@@ -220,6 +220,7 @@ describe("subscription bridge", () => {
         webhookUrl: "https://hooks.example.test/secret-capability",
         events: ["reviews"],
         behavior: "investigate",
+        deliveryMode,
       }, "POST", threadID))
     }
     const forwarded: Array<{ body: string; idempotencyKey: string | null }> = []
@@ -259,6 +260,8 @@ describe("subscription bridge", () => {
     expect(forwarded).toHaveLength(2)
     expect(forwarded.map(({ body: forwardedBody }) => JSON.parse(forwardedBody).targetThreadID).sort())
       .toEqual(["T-thread-one", "T-thread-two"])
+    expect(forwarded.map(({ body: forwardedBody }) => JSON.parse(forwardedBody).deliveryMode).sort())
+      .toEqual(["queue", "steer"])
     expect(new Set(forwarded.map(({ idempotencyKey }) => idempotencyKey)).size).toBe(2)
     for (const delivery of forwarded) {
       expect(delivery.idempotencyKey).toMatch(/^delivery-1:reviews:42:17:[0-9a-f-]+$/)
@@ -405,6 +408,35 @@ describe("subscription bridge", () => {
     }))
     expect(response.status).toBe(400)
     expect(await response.json()).toEqual({ error: "branch subscriptions support only commits and checks" })
+  })
+
+  test("rejects an invalid subscription delivery mode", async () => {
+    const response = await bridge().fetch(apiRequest({
+      repository: "lox/project",
+      targetType: "pull_request",
+      pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/secret-capability",
+      events: ["reviews"],
+      behavior: "notify",
+      deliveryMode: "interrupt",
+    }))
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: "invalid deliveryMode" })
+  })
+
+  test("preserves a delivery mode when an older client updates the subscription", async () => {
+    const app = bridge()
+    const input = {
+      repository: "lox/project",
+      targetType: "pull_request",
+      pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/secret-capability",
+      events: ["reviews"],
+      behavior: "notify",
+    }
+    expect((await app.fetch(apiRequest({ ...input, deliveryMode: "queue" }))).status).toBe(201)
+    expect((await app.fetch(apiRequest(input))).status).toBe(201)
+    expect(app.database.list("T-test")[0]?.deliveryMode).toBe("queue")
   })
 
   test("rejects lifecycle events for a repository subscription", async () => {

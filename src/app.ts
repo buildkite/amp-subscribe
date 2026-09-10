@@ -12,6 +12,7 @@ import {
   type RoutedEvent,
   type Subscription,
   type SubscriptionBehavior,
+  type SubscriptionDeliveryMode,
   type SubscriptionEvent,
   type WebhookBinding,
 } from "./types"
@@ -90,6 +91,10 @@ function validEvents(value: unknown): value is SubscriptionEvent[] {
 
 function validBehavior(value: unknown): value is SubscriptionBehavior {
   return value === "notify" || value === "investigate" || value === "implement"
+}
+
+function validDeliveryMode(value: unknown): value is SubscriptionDeliveryMode {
+  return value === "automatic" || value === "queue" || value === "steer"
 }
 
 function parseWebhookBinding(value: unknown): WebhookBinding | null {
@@ -190,6 +195,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       const webhookUrl = input?.webhookUrl
       const events = input?.events
       const behavior = input?.behavior
+      const deliveryMode = input?.deliveryMode
       const webhookBinding = parseWebhookBinding(input?.webhookBinding)
       if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
       if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
@@ -217,12 +223,16 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         return json({ error: "repository subscriptions support only pull_requests and issues" }, 400)
       }
       if (!validBehavior(behavior)) return json({ error: "invalid behavior" }, 400)
+      if (deliveryMode !== undefined && !validDeliveryMode(deliveryMode)) {
+        return json({ error: "invalid deliveryMode" }, 400)
+      }
       const common = {
         threadId: identity.threadId,
         repository,
         webhookUrl,
         events,
         behavior,
+        deliveryMode,
       }
       const subscription = targetType === "pull_request"
         ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number }, webhookBinding)
@@ -327,6 +337,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         const forwardedBody = JSON.stringify({
           ...event,
           behavior: subscription.behavior,
+          deliveryMode: subscription.deliveryMode,
           targetThreadID: subscription.threadId,
         })
         let response: Response

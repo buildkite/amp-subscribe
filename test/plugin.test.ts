@@ -579,7 +579,7 @@ describe("webhook handler delivery", () => {
     expect(steer).toBe(false)
   })
 
-  test("steers routine GitHub events for Chris without changing other users", async () => {
+  test("applies per-subscription delivery mode before the user default", async () => {
     const steering: Array<boolean | undefined> = []
     const append = async (_threadID: string, _message: unknown, options: { steer?: boolean }) => {
       steering.push(options.steer)
@@ -589,15 +589,35 @@ describe("webhook handler delivery", () => {
       append, undefined, undefined, undefined, "T-chris", undefined, "catkins-bk",
     )
     const chrisEvent = webhookInvocation("chris-event", "T-chris")
+    chrisEvent.event.body = new TextEncoder().encode(JSON.stringify({
+      ...checkEvent("check_run", 400, "completed", "failure"),
+      targetThreadID: "T-chris",
+      deliveryMode: "queue",
+    }))
     await chrisHandler(chrisEvent.event, chrisEvent.context)
 
     const otherHandler = await captureWebhookHandler(
       append, undefined, undefined, undefined, "T-other", undefined, "another-user",
     )
     const otherEvent = webhookInvocation("other-event", "T-other")
+    otherEvent.event.body = new TextEncoder().encode(JSON.stringify({
+      ...JSON.parse(new TextDecoder().decode(otherEvent.event.body)),
+      deliveryMode: "steer",
+    }))
     await otherHandler(otherEvent.event, otherEvent.context)
 
-    expect(steering).toEqual([true, false])
+    expect(steering).toEqual([false, true])
+  })
+
+  test("uses Chris's steering default for automatic delivery", async () => {
+    let steer: boolean | undefined
+    const handler = await captureWebhookHandler(
+      async (_threadID, _message, options) => { steer = options.steer },
+      undefined, undefined, undefined, "T-chris", undefined, "catkins-bk",
+    )
+    const invocation = webhookInvocation("automatic-chris-event", "T-chris")
+    await handler(invocation.event, invocation.context)
+    expect(steer).toBe(true)
   })
 
   test("delivers each thread's feed events without passing them through GitHub coalescing", async () => {

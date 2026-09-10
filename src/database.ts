@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite"
-import type { FeedEntry, FeedSubscription, Subscription, SubscriptionBehavior, SubscriptionEvent, WebhookBinding } from "./types"
+import type { FeedEntry, FeedSubscription, Subscription, SubscriptionBehavior, SubscriptionDeliveryMode, SubscriptionEvent, WebhookBinding } from "./types"
 
 type WithoutStoredFields<T> = T extends unknown ? Omit<T, "id" | "createdAt" | "webhookBinding"> : never
-type SubscriptionInput = WithoutStoredFields<Subscription>
+type WithOptionalDeliveryMode<T> = T extends unknown
+  ? Omit<T, "deliveryMode"> & { deliveryMode?: SubscriptionDeliveryMode }
+  : never
+type SubscriptionInput = WithOptionalDeliveryMode<WithoutStoredFields<Subscription>>
 
 interface SubscriptionRow {
   id: string
@@ -15,6 +18,7 @@ interface SubscriptionRow {
   webhook_binding: WebhookBinding
   events: string
   behavior: SubscriptionBehavior
+  delivery_mode: SubscriptionDeliveryMode
   created_at: string
 }
 
@@ -53,6 +57,7 @@ function mapSubscription(row: SubscriptionRow): Subscription {
     webhookBinding: row.webhook_binding,
     events: JSON.parse(row.events) as SubscriptionEvent[],
     behavior: row.behavior,
+    deliveryMode: row.delivery_mode,
     createdAt: row.created_at,
   }
   if (row.target_type === "branch" && row.target) {
@@ -88,6 +93,8 @@ export class SubscriptionDatabase {
         webhook_url TEXT NOT NULL,
         events TEXT NOT NULL,
         behavior TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL DEFAULT 'automatic'
+          CHECK(delivery_mode IN ('automatic', 'queue', 'steer')),
         created_at TEXT NOT NULL,
         UNIQUE(thread_id, repository, target_type, target),
         UNIQUE(thread_id, repository, pull_request_number)
@@ -127,6 +134,11 @@ export class SubscriptionDatabase {
         this.sqlite.exec(`ALTER TABLE ${table} ADD COLUMN webhook_binding TEXT NOT NULL
           DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1'))`)
       }
+    }
+    const subscriptionColumns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(subscriptions)").all()
+    if (!subscriptionColumns.some((column) => column.name === "delivery_mode")) {
+      this.sqlite.exec(`ALTER TABLE subscriptions ADD COLUMN delivery_mode TEXT NOT NULL
+        DEFAULT 'automatic' CHECK(delivery_mode IN ('automatic', 'queue', 'steer'))`)
     }
   }
 
@@ -224,11 +236,17 @@ export class SubscriptionDatabase {
       id: existing?.id ?? crypto.randomUUID(),
       createdAt: existing?.created_at ?? new Date().toISOString(),
     }
-    const subscription: Subscription = { ...input, ...stored, webhookBinding }
+    const subscription: Subscription = {
+      ...input,
+      deliveryMode: input.deliveryMode ?? existing?.delivery_mode ?? "automatic",
+      ...stored,
+      webhookBinding,
+    }
     if (existing) {
       this.sqlite.query(`
         UPDATE subscriptions SET
-          target_type = ?, target = ?, pull_request_number = ?, webhook_url = ?, events = ?, behavior = ?, webhook_binding = ?
+          target_type = ?, target = ?, pull_request_number = ?, webhook_url = ?, events = ?, behavior = ?,
+          delivery_mode = ?, webhook_binding = ?
         WHERE id = ?
       `).run(
         subscription.targetType,
@@ -237,6 +255,7 @@ export class SubscriptionDatabase {
         subscription.webhookUrl,
         JSON.stringify(subscription.events),
         subscription.behavior,
+        subscription.deliveryMode,
         webhookBinding,
         subscription.id,
       )
@@ -244,8 +263,8 @@ export class SubscriptionDatabase {
       this.sqlite.query(`
         INSERT INTO subscriptions
           (id, thread_id, repository, pull_request_number, target_type, target,
-            webhook_url, events, behavior, created_at, webhook_binding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            webhook_url, events, behavior, delivery_mode, created_at, webhook_binding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         subscription.id,
         subscription.threadId,
@@ -256,6 +275,7 @@ export class SubscriptionDatabase {
         subscription.webhookUrl,
         JSON.stringify(subscription.events),
         subscription.behavior,
+        subscription.deliveryMode,
         subscription.createdAt,
         webhookBinding,
       )

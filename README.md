@@ -52,6 +52,9 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
    Investigate reviews and CI failures.
    ```
 
+   Add “always queue these events” or “always steer these events” when creating a GitHub
+   subscription to override automatic delivery for that subscription.
+
    Or watch a branch:
 
    ```text
@@ -86,9 +89,10 @@ Deploy the updated bridge **before** updating the plugin. On startup, the plugin
 `github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with
 `{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`.
 The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
-subscriptions to the new URL. Subscription IDs, behaviors, event filters, delivery history, and
-feed baselines are preserved. Startup adds a `webhook_binding` column to both subscription tables,
-defaulting existing rows to `legacy`. Repeated plugin loads use the same key
+subscriptions to the new URL. Subscription IDs, behaviors, delivery modes, event filters, delivery
+history, and feed baselines are preserved. Startup adds a `webhook_binding` column to both
+subscription tables, defaulting existing rows to `legacy`, and defaults existing GitHub
+subscriptions to `automatic` delivery. Repeated plugin loads use the same key
 and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
 until the bridge is upgraded and the plugin is reloaded.
 
@@ -189,9 +193,10 @@ For feeds, the bridge polls public HTTPS URLs every five minutes by default. Set
 used when feeds provide ETag or Last-Modified headers.
 
 The bridge drops queued and in-progress check lifecycle events before they consume durable webhook
-capacity. For Chris Atkins (`catkins-bk`), all GitHub events steer so they are preferred when his
-active thread next dequeues work. For other users, the plugin only steers terminal failures;
-routine events retain their queued delivery behavior. For pull requests, a successful check
+capacity. GitHub subscriptions accept a delivery mode: `queue` never steers, `steer` always steers,
+and `automatic` applies the plugin default. Automatic delivery steers every GitHub event for Chris
+Atkins (`catkins-bk`); for other users it only steers terminal failures and queues routine events.
+Existing subscriptions default to `automatic`. For pull requests, a successful check
 triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
 GitHub's current status rollup has passed. Branch check successes retain short-window batching. The
