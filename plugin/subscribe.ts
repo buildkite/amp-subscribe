@@ -26,6 +26,7 @@ const automaticPullRequestEvents = [
   "closed",
 ]
 const defaultBranchEvents = ["commits", "checks"]
+const githubEventSteeringUsernames = new Set(["catkins-bk"])
 
 type SubscriptionTarget =
   | { targetType: "pull_request"; repository: string; number: number }
@@ -656,7 +657,7 @@ export interface CoalescingResult {
 export class PendingThreadDeliveryDeduplicator {
   private readonly executions = new Map<string, Promise<void>>()
 
-  async append(target: PluginThread, delivery: CoalescedDelivery): Promise<boolean> {
+  async append(target: PluginThread, delivery: CoalescedDelivery, steer = delivery.urgent): Promise<boolean> {
     const previous = this.executions.get(target.id) ?? Promise.resolve()
     const execution = previous.catch(() => undefined).then(async () => {
       const messages = await target.messages({ from: "end", limit: 20, roles: ["user", "assistant"] })
@@ -676,7 +677,7 @@ export class PendingThreadDeliveryDeduplicator {
       if (alreadyPending) return false
       await target.appendUserMessage(
         { type: "user-message", content: delivery.content },
-        { steer: delivery.urgent },
+        { steer },
       )
       return true
     })
@@ -1183,6 +1184,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
   const pullRequestCreateMarkers = new Map<string, string>()
   const coalescer = new GitHubEventCoalescer()
   const pendingDeliveries = new PendingThreadDeliveryDeduplicator()
+  const steerGitHubEvents = githubEventSteeringUsernames.has(amp.system.user?.username ?? "")
   const seen = new Set<string>()
   const executions = new Map<string, Promise<void>>()
   const counters = { received: 0, delivered: 0, suppressed: 0, batched: 0 }
@@ -1231,7 +1233,8 @@ export default async function ampSubscribe(amp: PluginAPI) {
             ? await readPullRequestCIState(amp, payload)
             : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
-            if (!await pendingDeliveries.append(targetThread, delivery)) {
+            const steer = steerGitHubEvents || delivery.urgent
+            if (!await pendingDeliveries.append(targetThread, delivery, steer)) {
               counters.suppressed += 1
               ctx.logger.log("GitHub event suppressed", {
                 reason: "matching message already pending in target thread",
@@ -1244,7 +1247,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
             if (delivery.reason.endsWith("batch")) counters.batched += 1
             ctx.logger.log("GitHub event delivered", {
               reason: delivery.reason,
-              steer: delivery.urgent,
+              steer,
               eventId: event.id,
               ...counters,
             })

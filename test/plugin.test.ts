@@ -170,6 +170,7 @@ async function captureWebhookHandler(
   messages: (threadID: string) => Promise<unknown[]> = async () => [],
   threadID = "T-target-thread",
   registrationKeys: string[] = [],
+  username = "another-user",
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
   const previous = { AMP_ORB: process.env.AMP_ORB, AMP_THREAD_ID: process.env.AMP_THREAD_ID, AMP_SUBSCRIBE_URL: process.env.AMP_SUBSCRIBE_URL }
@@ -196,6 +197,7 @@ async function captureWebhookHandler(
       },
       threads: { get: () => { throw new Error("must not route to another thread") } },
       activeThread: { current: { id: "T-unrelated-ui-focus" } },
+      system: { user: { username } },
       on: () => undefined,
       registerTool: () => undefined,
       helpers: { shellCommandFromToolCall: () => null },
@@ -575,6 +577,27 @@ describe("webhook handler delivery", () => {
     expect(completed).toBe(true)
     expect(stateReads).toBe(0)
     expect(steer).toBe(false)
+  })
+
+  test("steers routine GitHub events for Chris without changing other users", async () => {
+    const steering: Array<boolean | undefined> = []
+    const append = async (_threadID: string, _message: unknown, options: { steer?: boolean }) => {
+      steering.push(options.steer)
+    }
+
+    const chrisHandler = await captureWebhookHandler(
+      append, undefined, undefined, undefined, "T-chris", undefined, "catkins-bk",
+    )
+    const chrisEvent = webhookInvocation("chris-event", "T-chris")
+    await chrisHandler(chrisEvent.event, chrisEvent.context)
+
+    const otherHandler = await captureWebhookHandler(
+      append, undefined, undefined, undefined, "T-other", undefined, "another-user",
+    )
+    const otherEvent = webhookInvocation("other-event", "T-other")
+    await otherHandler(otherEvent.event, otherEvent.context)
+
+    expect(steering).toEqual([true, false])
   })
 
   test("delivers each thread's feed events without passing them through GitHub coalescing", async () => {

@@ -189,8 +189,10 @@ For feeds, the bridge polls public HTTPS URLs every five minutes by default. Set
 used when feeds provide ETag or Last-Modified headers.
 
 The bridge drops queued and in-progress check lifecycle events before they consume durable webhook
-capacity. The plugin immediately queues terminal failures, but routine events do not steer active
-work. For pull requests, a successful check triggers an authenticated `gh` lookup: the plugin
+capacity. For Chris Atkins (`catkins-bk`), all GitHub events steer so they are preferred when his
+active thread next dequeues work. For other users, the plugin only steers terminal failures;
+routine events retain their queued delivery behavior. For pull requests, a successful check
+triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
 GitHub's current status rollup has passed. Branch check successes retain short-window batching. The
 plugin also batches review submissions with their line comments, queues agent-authored comment
@@ -208,6 +210,11 @@ messages, the maximum supported by one plugin API call.
 
 The pending-message check is plugin-side and does not change the bridge payload. The per-thread
 webhook migration does require the bridge update described above.
+
+The current Amp plugin API does not expose whether a thread is snoozed or let this plugin snooze it.
+Delivery is therefore not snooze-gated: treating idle state as snoozed could silently discard an
+event, while retaining it would require a durable plugin-side retry queue. Threads do not need to
+snooze themselves for subscriptions to work.
 
 ## Self-hosting
 
