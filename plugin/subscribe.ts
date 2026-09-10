@@ -26,6 +26,8 @@ const automaticPullRequestEvents = [
   "closed",
 ]
 const defaultBranchEvents = ["commits", "checks"]
+const deliveryModes = ["automatic", "queue", "steer"] as const
+type DeliveryMode = (typeof deliveryModes)[number]
 
 type SubscriptionTarget =
   | { targetType: "pull_request"; repository: string; number: number }
@@ -87,7 +89,8 @@ async function subscribe(
   target: SubscriptionTarget,
   events: unknown[],
   behavior: string,
-): Promise<{ id: string }> {
+  deliveryMode?: DeliveryMode,
+): Promise<{ id: string; deliveryMode: DeliveryMode }> {
   const response = await bridgeRequest(amp, "/api/subscriptions", {
     method: "POST",
     body: JSON.stringify({
@@ -100,10 +103,11 @@ async function subscribe(
       webhookBinding: "thread_v1",
       events,
       behavior,
+      ...(deliveryMode ? { deliveryMode } : {}),
     }),
   })
-  const result = await response.json() as { subscription: { id: string } }
-  return result.subscription
+  const result = await response.json() as { subscription: { id: string; deliveryMode?: DeliveryMode } }
+  return { id: result.subscription.id, deliveryMode: result.subscription.deliveryMode ?? "automatic" }
 }
 
 async function subscribeToFeed(
@@ -656,7 +660,7 @@ export interface CoalescingResult {
 export class PendingThreadDeliveryDeduplicator {
   private readonly executions = new Map<string, Promise<void>>()
 
-  async append(target: PluginThread, delivery: CoalescedDelivery): Promise<boolean> {
+  async append(target: PluginThread, delivery: CoalescedDelivery, steer = delivery.urgent): Promise<boolean> {
     const previous = this.executions.get(target.id) ?? Promise.resolve()
     const execution = previous.catch(() => undefined).then(async () => {
       const messages = await target.messages({ from: "end", limit: 20, roles: ["user", "assistant"] })
@@ -676,7 +680,7 @@ export class PendingThreadDeliveryDeduplicator {
       if (alreadyPending) return false
       await target.appendUserMessage(
         { type: "user-message", content: delivery.content },
-        { steer: delivery.urgent },
+        { steer },
       )
       return true
     })
@@ -1222,6 +1226,10 @@ export default async function ampSubscribe(amp: PluginAPI) {
         } else {
           const parsedPayload = object(payload)
           if (!parsedPayload) throw new Error("Rejected malformed GitHub event")
+          const deliveryMode = parsedPayload.deliveryMode === undefined
+            ? "automatic"
+            : enumValue(parsedPayload.deliveryMode, deliveryModes)
+          if (!deliveryMode) throw new Error("Rejected malformed GitHub event")
           const metadata = promptMetadata(parsedPayload)
           const detail = object(metadata.detail)
           const pullRequestCI = text(metadata, "targetType") === "pull_request"
@@ -1231,7 +1239,9 @@ export default async function ampSubscribe(amp: PluginAPI) {
             ? await readPullRequestCIState(amp, payload)
             : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
-            if (!await pendingDeliveries.append(targetThread, delivery)) {
+            const steer = deliveryMode === "steer"
+              || (deliveryMode === "automatic" && delivery.urgent)
+            if (!await pendingDeliveries.append(targetThread, delivery, steer)) {
               counters.suppressed += 1
               ctx.logger.log("GitHub event suppressed", {
                 reason: "matching message already pending in target thread",
@@ -1244,7 +1254,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
             if (delivery.reason.endsWith("batch")) counters.batched += 1
             ctx.logger.log("GitHub event delivered", {
               reason: delivery.reason,
-              steer: delivery.urgent,
+              steer,
               eventId: event.id,
               ...counters,
             })
@@ -1372,6 +1382,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a URL or GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: pullRequestEvents }, description: "Events to subscribe to; defaults to all supported events" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
       },
       required: ["pullRequest"],
     },
@@ -1385,8 +1396,9 @@ export default async function ampSubscribe(amp: PluginAPI) {
       const target = parsePullRequest(pullRequest, repository)
       const events = Array.isArray(input.events) ? input.events : pullRequestEvents
       const behavior = typeof input.behavior === "string" ? input.behavior : "investigate"
-      const subscription = await subscribe(amp, webhookUrl, { ...target, targetType: "pull_request" }, events, behavior)
-      return `Subscribed this thread to ${target.repository}#${target.number} (${behavior}; ${events.join(", ")}). Subscription ID: ${subscription.id}`
+      const deliveryMode = enumValue(input.deliveryMode, deliveryModes)
+      const subscription = await subscribe(amp, webhookUrl, { ...target, targetType: "pull_request" }, events, behavior, deliveryMode)
+      return `Subscribed this thread to ${target.repository}#${target.number} (${behavior}; ${subscription.deliveryMode} delivery; ${events.join(", ")}). Subscription ID: ${subscription.id}`
     },
   })
 
@@ -1400,6 +1412,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: repositoryEvents }, description: "Events to subscribe to; defaults to pull requests and issues" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
       },
     },
     async execute(input, ctx) {
@@ -1411,15 +1424,17 @@ export default async function ampSubscribe(amp: PluginAPI) {
       if (!repository) throw new Error("Provide repository as owner/repo, or configure a GitHub origin remote")
       const events = Array.isArray(input.events) ? input.events : repositoryEvents
       const behavior = typeof input.behavior === "string" ? input.behavior : "investigate"
+      const deliveryMode = enumValue(input.deliveryMode, deliveryModes)
       const subscription = await subscribe(
         amp,
         webhookUrl,
         { targetType: "repository", repository },
         events,
         behavior,
+        deliveryMode,
       )
       const labels = events.map((event) => event === "pull_requests" ? "pull requests" : event)
-      return `Subscribed this thread to new ${labels.join(" and ")} in ${repository} (${behavior}). Subscription ID: ${subscription.id}`
+      return `Subscribed this thread to new ${labels.join(" and ")} in ${repository} (${behavior}; ${subscription.deliveryMode} delivery). Subscription ID: ${subscription.id}`
     },
   })
 
@@ -1434,6 +1449,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: defaultBranchEvents }, description: "Events to subscribe to; defaults to commits and checks" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
       },
       required: ["branch"],
     },
@@ -1448,14 +1464,16 @@ export default async function ampSubscribe(amp: PluginAPI) {
       if (!repository) throw new Error("Provide repository as owner/repo, or configure a GitHub origin remote")
       const events = Array.isArray(input.events) ? input.events : defaultBranchEvents
       const behavior = typeof input.behavior === "string" ? input.behavior : "investigate"
+      const deliveryMode = enumValue(input.deliveryMode, deliveryModes)
       const subscription = await subscribe(
         amp,
         webhookUrl,
         { targetType: "branch", repository, branch },
         events,
         behavior,
+        deliveryMode,
       )
-      return `Subscribed this thread to ${repository}@${branch} (${behavior}; ${events.join(", ")}). Subscription ID: ${subscription.id}`
+      return `Subscribed this thread to ${repository}@${branch} (${behavior}; ${subscription.deliveryMode} delivery; ${events.join(", ")}). Subscription ID: ${subscription.id}`
     },
   })
 

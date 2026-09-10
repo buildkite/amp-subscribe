@@ -52,6 +52,9 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
    Investigate reviews and CI failures.
    ```
 
+   Add “always queue these events” or “always steer these events” when creating a GitHub
+   subscription to override automatic delivery for that subscription.
+
    Or watch a branch:
 
    ```text
@@ -86,9 +89,10 @@ Deploy the updated bridge **before** updating the plugin. On startup, the plugin
 `github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with
 `{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`.
 The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
-subscriptions to the new URL. Subscription IDs, behaviors, event filters, delivery history, and
-feed baselines are preserved. Startup adds a `webhook_binding` column to both subscription tables,
-defaulting existing rows to `legacy`. Repeated plugin loads use the same key
+subscriptions to the new URL. Subscription IDs, behaviors, delivery modes, event filters, delivery
+history, and feed baselines are preserved. Startup adds a `webhook_binding` column to both
+subscription tables, defaulting existing rows to `legacy`, and defaults existing GitHub
+subscriptions to `automatic` delivery. Repeated plugin loads use the same key
 and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
 until the bridge is upgraded and the plugin is reloaded.
 
@@ -189,8 +193,10 @@ For feeds, the bridge polls public HTTPS URLs every five minutes by default. Set
 used when feeds provide ETag or Last-Modified headers.
 
 The bridge drops queued and in-progress check lifecycle events before they consume durable webhook
-capacity. The plugin immediately queues terminal failures, but routine events do not steer active
-work. For pull requests, a successful check triggers an authenticated `gh` lookup: the plugin
+capacity. GitHub subscriptions accept a delivery mode: `queue` never steers, `steer` always steers,
+and `automatic` only steers terminal failures while queuing routine events. Existing subscriptions
+default to `automatic`. For pull requests, a successful check
+triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
 GitHub's current status rollup has passed. Branch check successes retain short-window batching. The
 plugin also batches review submissions with their line comments, queues agent-authored comment
@@ -208,6 +214,11 @@ messages, the maximum supported by one plugin API call.
 
 The pending-message check is plugin-side and does not change the bridge payload. The per-thread
 webhook migration does require the bridge update described above.
+
+The current Amp plugin API does not expose whether a thread is snoozed or let this plugin snooze it.
+Delivery is therefore not snooze-gated: treating idle state as snoozed could silently discard an
+event, while retaining it would require a durable plugin-side retry queue. Threads do not need to
+snooze themselves for subscriptions to work.
 
 ## Self-hosting
 

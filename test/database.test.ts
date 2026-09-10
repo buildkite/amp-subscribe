@@ -86,6 +86,7 @@ describe("SubscriptionDatabase", () => {
       webhookBinding: "legacy",
       events: ["reviews"],
       behavior: "investigate",
+      deliveryMode: "automatic",
       createdAt: "2026-08-23T00:00:00.000Z",
     }])
     expect(database.wasDelivered("sub-1", "delivery-1", "reviews")).toBe(true)
@@ -235,8 +236,10 @@ describe("SubscriptionDatabase", () => {
       webhookUrl: "https://hooks.example.test/updated",
       events: ["issues"],
       behavior: "investigate",
+      deliveryMode: "queue",
     })
     expect(updated.id).toBe(subscription.id)
+    expect(updated.deliveryMode).toBe("queue")
     expect(database.list("T-test")).toEqual([updated])
     database.close()
   })

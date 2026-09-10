@@ -12,6 +12,7 @@ export const subscriptionEvents = [
 
 export type SubscriptionEvent = (typeof subscriptionEvents)[number]
 export type SubscriptionBehavior = "notify" | "investigate" | "implement"
+export type SubscriptionDeliveryMode = "automatic" | "queue" | "steer"
 export type WebhookBinding = "legacy" | "thread_v1"
 
 export const checkStatuses = ["requested", "waiting", "pending", "queued", "in_progress", "completed"] as const
@@ -114,6 +115,7 @@ interface SubscriptionBase {
   webhookBinding: WebhookBinding
   events: SubscriptionEvent[]
   behavior: SubscriptionBehavior
+  deliveryMode: SubscriptionDeliveryMode
   createdAt: string
 }
 
