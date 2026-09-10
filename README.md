@@ -80,6 +80,25 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
 Keep the plugin filename `subscribe.ts` when upgrading. Amp includes the plugin identity in its
 durable webhook URLs, so renaming it would disconnect existing subscriptions.
 
+### Upgrade from a shared webhook
+
+Deploy the updated bridge **before** updating the plugin. On startup, the plugin registers
+`github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with `{ "webhookUrl": "..." }`.
+The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
+subscriptions to the new URL. Subscription IDs, behaviors, event filters, delivery history, and
+feed baselines are preserved. No schema migration is needed. Repeated plugin loads use the same key
+and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
+until the bridge is upgraded and the plugin is reloaded.
+
+Reload the updated plugin in each subscribed thread to migrate it; dormant threads remain on the
+old endpoint until their plugin starts. The old shared webhook is not deleted because other threads
+may still use it. Do not roll back the plugin in migrated threads: that would restore shared URLs.
+Subscriptions already deleted by the old relay must be recreated. Events missed before or during
+the transition, including events queued at the old Amp registration, may need manual GitHub
+redelivery after migration. This change adds no retry queue or indefinite event retention; existing
+HTTP 404/410 removal behavior remains, except that a late response from a replaced URL cannot remove
+the migrated subscription. Archiving a subscribing thread can still stop its own notifications.
+
 When upgrading from a version that does not include an authenticated target thread in forwarded
 events, deploy the bridge before updating the plugin. The bridge field is additive, so the old
 plugin tolerates it; the updated plugin rejects events without it rather than risk appending them to
@@ -109,18 +128,18 @@ RSS/Atom ───poll──────┘          ▲                        
                                 └──────── subscription ──────────┘
 ```
 
-The plugin creates a durable webhook and registers what the current thread wants to watch. Amp can
-share one plugin webhook registration across several project threads owned by the same user, so the
-bridge stores the authenticated subscribing thread ID with each subscription. amp-subscribe
-verifies matching GitHub events, adds that trusted target thread ID to a small event summary, and
-stores it in a SQLite delivery queue before replying HTTP 202 to GitHub. A worker forwards queued
-events to the webhook. The plugin validates the ID and looks up the target thread explicitly.
-Feed events use the same target-thread routing contract.
+The plugin creates **one durable webhook per thread**, shared only by that thread's GitHub and feed
+subscriptions. Amp shares registrations for the same user/project/plugin/key, so the key includes
+the orb's `AMP_THREAD_ID` instead of using one fixed project-wide key. Registration happens when the
+plugin loads, including on orb restart, without waiting for a tool call or session-start event.
+Missing thread identity is an error; the plugin does not fall back to a shared key or UI focus.
 
-An asleep orb can be woken by Amp, but an **archived owner of a shared webhook** can make Amp reject
-the request with HTTP 404 before the plugin runs, even when the subscribing thread is active.
-The bridge cannot reassign that owner: the public plugin API returns a shared capability URL, not
-an ownership-transfer API. See [Recovering failed deliveries](#recovering-failed-deliveries).
+The bridge stores the authenticated subscribing thread ID, verifies matching GitHub events, and
+forwards bounded metadata with that trusted target ID. The handler checks that its registration
+owner, orb thread, and payload target all agree, then appends to the owning thread. It never forwards
+to another thread. This isolates active subscribers from an unrelated thread's archived webhook
+owner. Amp can store events and wake the owning thread while its orb is asleep. Feed events use
+the same routing contract.
 
 For feeds, the bridge polls public HTTPS URLs every five minutes by default. Set
 `FEED_POLL_INTERVAL_SECONDS` to change the interval (minimum 30 seconds). Conditional requests are
@@ -136,68 +155,16 @@ replies without steering active work, and suppresses pull request body/title edi
 logs include delivery reasons, steering decisions, and cumulative received/delivered/suppressed/
 batched counts.
 
-GitHub delivery IDs are deduplicated durably while queued and after successful forwarding. Failed
-deliveries retain their original payload and idempotency key across process restarts. A single
-worker checks for work every second, with at most 100 attempts per pass and a 10-second timeout per
-attempt. Failures back off from one minute to one hour, respecting a longer `Retry-After`. Pending
-events preserve arrival order within each subscription; other subscriptions can progress while one
-backs off. This preserves arrival order, not GitHub's event-generation order. Retries continue until
-Amp accepts the event or the user explicitly unsubscribes. Delivery is at-least-once, not exactly-once.
-Queued events keep the target thread and behavior captured at arrival; re-registering changes their
-destination webhook URL, not their stored payload.
-
-The GitHub HTTP 202 response now reports `queued` (newly persisted subscription deliveries), not
-`delivered`/`removed`. `matchedEvents` counts normalized events, **not matching subscriptions**.
-GitHub does [not automatically retry failed webhooks](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries);
-the bridge's queue handles failures after persistence, but cannot recover events that never reached
-the bridge or could not be committed to its database.
-
-Thread-side batching and the short semantic event cache are process-local. Before appending a
-GitHub message, the plugin also reads the target thread's recent transcript and suppresses an exact
-content match among user messages after
+GitHub delivery IDs are deduplicated durably by the bridge. Thread-side batching and the short
+semantic event cache are process-local. Before appending a GitHub message, the plugin also reads the
+target thread's recent transcript and suppresses an exact content match among user messages after
 the latest assistant message. This catches a retry or restarted handler when the same generated
 message is already stacked for the agent, while allowing changed check or review details and an
 update that the agent previously handled. The read covers the 20 most recent user/assistant
 messages, the maximum supported by one plugin API call.
 
-This pending-message check is entirely plugin-side; it does not change the bridge payload or API.
-Deploying the bridge is therefore unnecessary, and mixed installations are safe while the updated
-`subscribe.ts` plugin rolls out.
-
-## Recovering failed deliveries
-
-The bridge no longer deletes GitHub or feed subscriptions on HTTP errors, including 404 and 410.
-It cannot know from those statuses whether a shared webhook's owner is recoverable. Permanent
-failures therefore require operator attention or an explicit unsubscribe; they do not silently
-discard queued GitHub events. Feed polling retries unseen entries on the next poll without advancing
-its cache validators after a delivery failure. Feeds do not use the GitHub queue: an entry that falls
-out of the upstream feed before recovery may still be lost.
-
-1. Ask Amp to list the affected thread's subscriptions. GitHub subscriptions include a `delivery`
-   object with the pending count and the oldest pending event's attempt count, last HTTP status,
-   last attempt, and next attempt times. A null HTTP status with attempts greater than zero denotes
-   a transport error. A null next-attempt time with pending work means it is eligible immediately.
-   The `amp_subscribe_pending_github_deliveries` gauge shows the total backlog.
-2. For a shared webhook owned by an archived thread, restore that owner with its user's approval,
-   or ask Amp support to repair/replace the registration. Reloading alone may return the same shared
-   URL. The bridge cannot discover the owner, unarchive it, or elect another thread.
-3. If the webhook URL changes, subscribe to the same target again **without unsubscribing first**.
-   This updates the URL in place, preserves the subscription ID and backlog, and makes queued events
-   eligible immediately. Restoring the original endpoint lets scheduled retries recover automatically.
-4. If an older relay already deleted the subscription, recreate it after fixing the webhook and
-   manually redeliver the missed events from the GitHub App's **Advanced → Recent deliveries** page.
-   The new queue cannot reconstruct historical events that the old version discarded.
-
-Failures emit `webhook_delivery_failed` logs containing the subscription/target thread IDs, exact
-HTTP status, webhook URL fingerprint and available request IDs. GitHub logs also include the delivery
-ID, Amp idempotency key, attempt and retry time (null if replaced or unsubscribed during the request).
-Raw response bodies, capability URLs, cookies and exception messages are deliberately omitted because
-they can contain credentials. Use the correlation
-IDs with Amp support to determine why its endpoint rejected a request.
-
-Unsubscribing explicitly discards that subscription's pending work and deduplication history; it
-cannot cancel an HTTP request already in flight. No automatic expiry or queue-size eviction is used.
-Monitor backlog and disk space, and resolve or unsubscribe permanently broken targets.
+The pending-message check is plugin-side and does not change the bridge payload. The per-thread
+webhook migration does require the bridge update described above.
 
 ## Self-hosting
 
@@ -236,10 +203,6 @@ mise exec -- bun run start
 ```
 
 Use `GET /healthz` as its health check and keep `DATABASE_PATH` on persistent storage in production.
-Run **one bridge process per database**; delivery-worker serialization is process-local. Startup adds
-the pending-delivery table without rewriting existing subscriptions or delivery records. Back up the
-database before deployment. An older binary does not drain queued work and may again delete failed
-subscriptions, so rolling back the binary is not a safe way to preserve a pending backlog.
 
 The bridge exposes Prometheus-format metrics (subscription counts, webhook delivery outcomes, feed poll
 results, and more) on `GET /metrics`, served on a separate port (`METRICS_PORT`, default `9091`). On

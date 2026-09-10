@@ -28,18 +28,6 @@ interface FeedSubscriptionRow {
   created_at: string
 }
 
-interface PendingGitHubDelivery {
-  id: number
-  subscription_id: string
-  delivery_id: string
-  event: string
-  body: string
-  idempotency_key: string
-  attempts: number
-  webhook_url: string
-  thread_id: string
-}
-
 function mapFeedSubscription(row: FeedSubscriptionRow): FeedSubscription {
   return {
     id: row.id,
@@ -108,22 +96,6 @@ export class SubscriptionDatabase {
         PRIMARY KEY(subscription_id, delivery_id, event),
         FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
       );
-      CREATE TABLE IF NOT EXISTS pending_github_deliveries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        subscription_id TEXT NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
-        delivery_id TEXT NOT NULL,
-        event TEXT NOT NULL,
-        body TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        next_attempt_at INTEGER NOT NULL DEFAULT 0,
-        last_attempt_at TEXT,
-        last_http_status INTEGER,
-        UNIQUE(subscription_id, delivery_id, event)
-      );
-      CREATE INDEX IF NOT EXISTS pending_github_subscription_order
-        ON pending_github_deliveries(subscription_id, id);
       CREATE TABLE IF NOT EXISTS feed_subscriptions (
         id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
@@ -255,10 +227,6 @@ export class SubscriptionDatabase {
         subscription.behavior,
         subscription.id,
       )
-      if (existing.webhook_url !== subscription.webhookUrl) {
-        this.sqlite.query("UPDATE pending_github_deliveries SET next_attempt_at = 0 WHERE subscription_id = ?")
-          .run(subscription.id)
-      }
     } else {
       this.sqlite.query(`
         INSERT INTO subscriptions
@@ -300,6 +268,13 @@ export class SubscriptionDatabase {
     ).all(threadId).map(mapSubscription)
   }
 
+  updateWebhook(threadId: string, webhookUrl: string): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.query("UPDATE subscriptions SET webhook_url = ? WHERE thread_id = ?").run(webhookUrl, threadId)
+      this.sqlite.query("UPDATE feed_subscriptions SET webhook_url = ? WHERE thread_id = ?").run(webhookUrl, threadId)
+    })()
+  }
+
   matching(repository: string, targetType: Subscription["targetType"], target: string, event: SubscriptionEvent): Subscription[] {
     return this.sqlite.query<SubscriptionRow, [string, string, string, string, string]>(`
       SELECT * FROM subscriptions WHERE repository = ?
@@ -309,8 +284,10 @@ export class SubscriptionDatabase {
       .filter((subscription) => subscription.events.includes(event))
   }
 
-  delete(threadId: string, id: string): boolean {
-    return this.sqlite.query("DELETE FROM subscriptions WHERE id = ? AND thread_id = ?").run(id, threadId).changes > 0
+  delete(threadId: string, id: string, webhookUrl: string | null = null): boolean {
+    return this.sqlite.query(`
+      DELETE FROM subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
+    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
   }
 
   wasDelivered(subscriptionId: string, deliveryId: string, event: string): boolean {
@@ -319,75 +296,11 @@ export class SubscriptionDatabase {
     `).get(subscriptionId, deliveryId, event) !== null
   }
 
-  enqueueGitHubDelivery(subscriptionId: string, deliveryId: string, event: string, body: string, key: string): number {
-    if (this.wasDelivered(subscriptionId, deliveryId, event)) return 0
-    return this.sqlite.query(`
-      INSERT OR IGNORE INTO pending_github_deliveries
-        (subscription_id, delivery_id, event, body, idempotency_key, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(subscriptionId, deliveryId, event, body, key, new Date().toISOString()).changes
-  }
-
-  nextGitHubDelivery(now: number): PendingGitHubDelivery | null {
-    // FIFO per subscription: a failed push must not be overtaken by later pushes.
-    // Other subscriptions can progress while this one's oldest event backs off.
-    return this.sqlite.query<PendingGitHubDelivery, [number]>(`
-      SELECT pending.*, subscriptions.webhook_url, subscriptions.thread_id
-      FROM pending_github_deliveries AS pending
-      JOIN subscriptions ON subscriptions.id = pending.subscription_id
-      WHERE pending.next_attempt_at <= ? AND NOT EXISTS (
-        SELECT 1 FROM pending_github_deliveries AS older
-        WHERE older.subscription_id = pending.subscription_id AND older.id < pending.id
-      )
-      ORDER BY pending.next_attempt_at, pending.id LIMIT 1
-    `).get(now)
-  }
-
-  completeGitHubDelivery(id: number): void {
-    this.sqlite.transaction(() => {
-      // The user may have unsubscribed while the HTTP request was in flight.
-      this.sqlite.query(`
-        INSERT OR IGNORE INTO deliveries (subscription_id, delivery_id, event, delivered_at)
-        SELECT subscription_id, delivery_id, event, ? FROM pending_github_deliveries WHERE id = ?
-      `).run(new Date().toISOString(), id)
-      this.sqlite.query("DELETE FROM pending_github_deliveries WHERE id = ?").run(id)
-    })()
-  }
-
-  failGitHubDelivery(id: number, webhookUrl: string, now: number, nextAttemptAt: number, status: number | null): number | null {
-    // A replacement endpoint must not inherit backoff from an old in-flight request.
-    return this.sqlite.query<{ next_attempt_at: number }, [string, string, number, number | null, number]>(`
-      UPDATE pending_github_deliveries SET attempts = attempts + 1,
-        last_attempt_at = ?, next_attempt_at = CASE WHEN
-          (SELECT webhook_url FROM subscriptions WHERE id = subscription_id) = ? THEN ? ELSE 0 END,
-        last_http_status = ? WHERE id = ? RETURNING next_attempt_at
-    `).get(new Date(now).toISOString(), webhookUrl, nextAttemptAt, status, id)?.next_attempt_at ?? null
-  }
-
-  githubDeliveryStatus(subscriptionId: string) {
-    const oldest = this.sqlite.query<{
-      created_at: string; attempts: number; last_attempt_at: string | null;
-      last_http_status: number | null; next_attempt_at: number
-    }, [string]>(`
-      SELECT created_at, attempts, last_attempt_at, last_http_status, next_attempt_at
-      FROM pending_github_deliveries WHERE subscription_id = ? ORDER BY id LIMIT 1
-    `).get(subscriptionId)
-    const pending = this.sqlite.query<{ count: number }, [string]>(
-      "SELECT COUNT(*) AS count FROM pending_github_deliveries WHERE subscription_id = ?",
-    ).get(subscriptionId)!.count
-    return {
-      pending,
-      oldestPendingAt: oldest?.created_at ?? null,
-      attempts: oldest?.attempts ?? 0,
-      lastAttemptAt: oldest?.last_attempt_at ?? null,
-      lastHttpStatus: oldest?.last_http_status ?? null,
-      nextAttemptAt: oldest?.next_attempt_at ? new Date(oldest.next_attempt_at).toISOString() : null,
-    }
-  }
-
-  pendingGitHubDeliveryCount(): number {
-    return this.sqlite.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_github_deliveries")
-      .get()!.count
+  markDelivered(subscriptionId: string, deliveryId: string, event: string): void {
+    this.sqlite.query(`
+      INSERT OR IGNORE INTO deliveries (subscription_id, delivery_id, event, delivered_at)
+      VALUES (?, ?, ?, ?)
+    `).run(subscriptionId, deliveryId, event, new Date().toISOString())
   }
 
   upsertFeed(input: Omit<FeedSubscription, "id" | "createdAt">, baseline: FeedEntry[]): FeedSubscription {
@@ -461,9 +374,10 @@ export class SubscriptionDatabase {
     `).run(subscriptionId, entry.id, entry.fingerprint, new Date().toISOString())
   }
 
-  deleteFeed(threadId: string, id: string): boolean {
-    return this.sqlite.query("DELETE FROM feed_subscriptions WHERE id = ? AND thread_id = ?")
-      .run(id, threadId).changes > 0
+  deleteFeed(threadId: string, id: string, webhookUrl: string | null = null): boolean {
+    return this.sqlite.query(`
+      DELETE FROM feed_subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
+    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
   }
 
   close(): void {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import type { PluginAPI } from "@ampcode/plugin"
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -148,7 +148,9 @@ type CapturedWebhookHandler = (event: {
   body: Uint8Array
 }, context: {
   thread: {
+    id: string
     appendUserMessage: (message: unknown, options: { steer?: boolean }) => Promise<void>
+    messages: () => Promise<unknown[]>
     state: { get: () => Promise<string> }
   }
   logger: { log: (...values: unknown[]) => void }
@@ -166,43 +168,58 @@ async function captureWebhookHandler(
   stateGet: () => Promise<string> = async () => "running",
   shell: PluginAPI["$"] = async () => ({ exitCode: 0, stdout: "amp-user\n", stderr: "" }),
   messages: (threadID: string) => Promise<unknown[]> = async () => [],
+  threadID = "T-target-thread",
+  registrationKeys: string[] = [],
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
-  const previousOrb = process.env.AMP_ORB
+  const previous = { AMP_ORB: process.env.AMP_ORB, AMP_THREAD_ID: process.env.AMP_THREAD_ID, AMP_SUBSCRIBE_URL: process.env.AMP_SUBSCRIBE_URL }
   process.env.AMP_ORB = "1"
+  process.env.AMP_THREAD_ID = threadID
+  process.env.AMP_SUBSCRIBE_URL = "https://bridge.example.test"
+  const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }))
   try {
     await ampSubscribe({
       $: shell,
       logger: { log: () => undefined },
-      createWebhook: async (options: { handler: CapturedWebhookHandler }) => {
-        handler = options.handler
-        return { url: "https://hooks.example.test/github" }
+      createWebhook: async (options: { key: string; handler: CapturedWebhookHandler }) => {
+        registrationKeys.push(options.key)
+        handler = (event, ctx) => options.handler(event, {
+          ...ctx,
+          thread: {
+            ...ctx.thread,
+            appendUserMessage: (message, options) => appendUserMessage(ctx.thread.id, message, options),
+            messages: () => messages(ctx.thread.id),
+            state: { get: stateGet },
+          },
+        })
+        return { url: `https://hooks.example.test/${options.key}` }
       },
-      threads: {
-        get: (threadID: string) => ({
-          id: threadID,
-          appendUserMessage: (message: unknown, options: { steer?: boolean }) =>
-            appendUserMessage(threadID, message, options),
-          messages: () => messages(threadID),
-          state: { get: stateGet },
-        }),
-      },
+      threads: { get: () => { throw new Error("must not route to another thread") } },
+      activeThread: { current: { id: "T-unrelated-ui-focus" } },
       on: () => undefined,
       registerTool: () => undefined,
       helpers: { shellCommandFromToolCall: () => null },
     } as unknown as PluginAPI)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(fetchSpy.mock.calls[0]![0]).toBe("https://bridge.example.test/api/webhook")
+    expect(fetchSpy.mock.calls[0]![1]).toMatchObject({
+      method: "PUT", body: JSON.stringify({ webhookUrl: `https://hooks.example.test/github-pr-events:${threadID}` }),
+    })
   } finally {
-    if (previousOrb === undefined) delete process.env.AMP_ORB
-    else process.env.AMP_ORB = previousOrb
+    fetchSpy.mockRestore()
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
   }
   if (!handler) throw new Error("Webhook handler was not registered")
   return handler
 }
 
-function webhookInvocation(id: string) {
+function webhookInvocation(id: string, threadID = "T-target-thread") {
   const routineEvent = {
     ...baseEvent,
-    targetThreadID: "T-target-thread",
+    targetThreadID: threadID,
     githubEvent: "pull_request",
     event: "pull_requests",
     action: "opened",
@@ -212,7 +229,9 @@ function webhookInvocation(id: string) {
     event: { id, body: new TextEncoder().encode(JSON.stringify(routineEvent)) },
     context: {
       thread: {
-        appendUserMessage: async () => { throw new Error("must not append through registration owner") },
+        id: threadID,
+        appendUserMessage: async () => undefined,
+        messages: async () => [],
         state: { get: async () => "running" },
       },
       logger: { log: () => undefined },
@@ -509,6 +528,35 @@ describe("feedPrompt", () => {
 })
 
 describe("webhook handler delivery", () => {
+  test("registers distinct thread keys at startup and reuses the key after restart", async () => {
+    const keys: string[] = []
+    for (const threadID of ["T-one", "T-two", "T-one"]) {
+      await captureWebhookHandler(undefined, undefined, undefined, undefined, threadID, keys)
+    }
+    expect(keys).toEqual(["github-pr-events:T-one", "github-pr-events:T-two", "github-pr-events:T-one"])
+  })
+
+  test("fails closed without an orb thread ID rather than registering a shared key", async () => {
+    const keys: string[] = []
+    await expect(captureWebhookHandler(undefined, undefined, undefined, undefined, "", keys))
+      .rejects.toThrow("AMP_THREAD_ID is required")
+    expect(keys).toEqual([])
+  })
+
+  test("rejects a different target or registration owner without appending", async () => {
+    let appendCalls = 0
+    const handler = await captureWebhookHandler(async () => { appendCalls += 1 })
+    const wrongTarget = webhookInvocation("wrong-target", "T-other")
+    wrongTarget.context.thread.id = "T-target-thread"
+    await expect(handler(wrongTarget.event, wrongTarget.context))
+      .rejects.toThrow("Webhook target does not match registration owner")
+    const wrongOwner = webhookInvocation("wrong-owner")
+    wrongOwner.context.thread.id = "T-other"
+    await expect(handler(wrongOwner.event, wrongOwner.context))
+      .rejects.toThrow("Webhook registration owner does not match orb thread")
+    expect(appendCalls).toBe(0)
+  })
+
   test("appends without waiting for thread-state telemetry", async () => {
     let stateReads = 0
     let steer: boolean | undefined
@@ -529,17 +577,17 @@ describe("webhook handler delivery", () => {
     expect(steer).toBe(false)
   })
 
-  test("routes shared-webhook feed events without passing them through GitHub coalescing", async () => {
+  test("delivers each thread's feed events without passing them through GitHub coalescing", async () => {
     const messages: unknown[] = []
     const deliveredThreadIDs: string[] = []
     const steering: Array<boolean | undefined> = []
-    const handler = await captureWebhookHandler(async (threadID, message, options) => {
-      deliveredThreadIDs.push(threadID)
-      messages.push(message)
-      steering.push(options.steer)
-    })
     for (const [index, targetThreadID] of ["T-feed-one", "T-feed-two"].entries()) {
-      const invocation = webhookInvocation(`feed-event-${index}`)
+      const handler = await captureWebhookHandler(async (threadID, message, options) => {
+        deliveredThreadIDs.push(threadID)
+        messages.push(message)
+        steering.push(options.steer)
+      }, undefined, undefined, undefined, targetThreadID)
+      const invocation = webhookInvocation(`feed-event-${index}`, targetThreadID)
       invocation.event.body = new TextEncoder().encode(JSON.stringify({
         schemaVersion: 1,
         source: "feed",
@@ -563,13 +611,11 @@ describe("webhook handler delivery", () => {
     expect(steering).toEqual([true, true])
   })
 
-  test("routes equivalent GitHub events on a shared webhook to their target threads", async () => {
+  test("delivers equivalent GitHub events through separate thread-owned webhooks", async () => {
     const delivered: string[] = []
-    const handler = await captureWebhookHandler(async (threadID) => { delivered.push(threadID) })
     for (const [index, threadID] of ["T-thread-one", "T-thread-two"].entries()) {
-      const invocation = webhookInvocation(`github-event-${index}`)
-      const payload = JSON.parse(new TextDecoder().decode(invocation.event.body))
-      invocation.event.body = new TextEncoder().encode(JSON.stringify({ ...payload, targetThreadID: threadID }))
+      const handler = await captureWebhookHandler(async (id) => { delivered.push(id) }, undefined, undefined, undefined, threadID)
+      const invocation = webhookInvocation(`github-event-${index}`, threadID)
       await handler(invocation.event, invocation.context)
     }
 
