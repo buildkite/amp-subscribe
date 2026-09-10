@@ -295,7 +295,7 @@ pushes to `main` trigger deployment through `.github/workflows/deploy.yml`. The 
 `lox-amp-subscribe` app:
 
 ```sh
-flyctl tokens create deploy --app bk-amp-subscribe | \
+mise exec -- flyctl tokens create deploy --app bk-amp-subscribe --expiry 8760h | \
   gh secret set FLY_API_TOKEN --repo buildkite/amp-subscribe
 ```
 
