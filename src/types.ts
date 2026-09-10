@@ -12,6 +12,7 @@ export const subscriptionEvents = [
 
 export type SubscriptionEvent = (typeof subscriptionEvents)[number]
 export type SubscriptionBehavior = "notify" | "investigate" | "implement"
+export type WebhookBinding = "legacy" | "thread_v1"
 
 export const checkStatuses = ["requested", "waiting", "pending", "queued", "in_progress", "completed"] as const
 export const checkConclusions = [
@@ -110,6 +111,7 @@ interface SubscriptionBase {
   threadId: string
   repository: string
   webhookUrl: string
+  webhookBinding: WebhookBinding
   events: SubscriptionEvent[]
   behavior: SubscriptionBehavior
   createdAt: string
@@ -126,6 +128,7 @@ export interface FeedSubscription {
   threadId: string
   feedUrl: string
   webhookUrl: string
+  webhookBinding: WebhookBinding
   behavior: SubscriptionBehavior
   etag: string | null
   lastModified: string | null

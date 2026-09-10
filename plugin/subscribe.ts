@@ -76,8 +76,7 @@ async function bridgeRequest(amp: PluginAPI, path: string, init: RequestInit = {
     signal: AbortSignal.timeout(10_000),
   })
   if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(`amp-subscribe returned ${response.status}: ${detail}`)
+    throw new Error(`amp-subscribe ${path} returned ${response.status}`)
   }
   return response
 }
@@ -98,6 +97,7 @@ async function subscribe(
         ? { pullRequestNumber: target.number }
         : target.targetType === "branch" ? { branch: target.branch } : {}),
       webhookUrl,
+      webhookBinding: "thread_v1",
       events,
       behavior,
     }),
@@ -114,7 +114,7 @@ async function subscribeToFeed(
 ): Promise<{ id: string }> {
   const response = await bridgeRequest(amp, "/api/feed-subscriptions", {
     method: "POST",
-    body: JSON.stringify({ feedUrl, webhookUrl, behavior }),
+    body: JSON.stringify({ feedUrl, webhookUrl, webhookBinding: "thread_v1", behavior }),
   })
   const result = await response.json() as { subscription: { id: string } }
   return result.subscription
@@ -1189,6 +1189,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
   const { url: webhookUrl } = await amp.createWebhook({
     key: `github-pr-events:${threadID}`,
     handler: async (event, ctx) => {
+      ctx.logger.log("Webhook event received", { eventId: event.id, ownerThreadID: ctx.thread.id, orbThreadID: threadID })
       if (ctx.thread.id !== threadID) throw new Error("Webhook registration owner does not match orb thread")
       counters.received += 1
       if (seen.has(event.id)) {
@@ -1269,8 +1270,9 @@ export default async function ampSubscribe(amp: PluginAPI) {
   // without deleting subscriptions, delivery history, or feed baselines.
   await bridgeRequest(amp, "/api/webhook", {
     method: "PUT",
-    body: JSON.stringify({ webhookUrl }),
+    body: JSON.stringify({ webhookUrl, webhookBinding: "thread_v1" }),
   })
+  amp.logger.log("Webhook binding registered", { threadID, webhookBinding: "thread_v1" })
 
   amp.on("tool.call", (event) => {
     const shell = amp.helpers.shellCommandFromToolCall(event)

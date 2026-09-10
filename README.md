@@ -83,10 +83,12 @@ durable webhook URLs, so renaming it would disconnect existing subscriptions.
 ### Upgrade from a shared webhook
 
 Deploy the updated bridge **before** updating the plugin. On startup, the plugin registers
-`github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with `{ "webhookUrl": "..." }`.
+`github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with
+`{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`.
 The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
 subscriptions to the new URL. Subscription IDs, behaviors, event filters, delivery history, and
-feed baselines are preserved. No schema migration is needed. Repeated plugin loads use the same key
+feed baselines are preserved. Startup adds a `webhook_binding` column to both subscription tables,
+defaulting existing rows to `legacy`. Repeated plugin loads use the same key
 and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
 until the bridge is upgraded and the plugin is reloaded.
 
@@ -98,6 +100,47 @@ the transition, including events queued at the old Amp registration, may need ma
 redelivery after migration. This change adds no retry queue or indefinite event retention; existing
 HTTP 404/410 removal behavior remains, except that a late response from a replaced URL cannot remove
 the migrated subscription. Archiving a subscribing thread can still stop its own notifications.
+
+#### Tracking completion and retiring legacy clients
+
+The plugin declares `webhookBinding: "thread_v1"` on migration and new subscriptions. The bridge
+persists it and returns it in subscription lists. Omitted bindings mean `legacy`, including on
+updates: an old plugin writing a shared URL clears the migrated marker. This is a client-declared
+version, not independent proof of Amp webhook ownership, handler execution, or successful wakeup.
+
+Watch `amp_subscribe_webhook_bindings{binding="legacy"}` for both `source="github"` and
+`source="feed"`; [dashboard queries](dashboards/README.md#webhook-migration) are provided. It counts
+current subscriptions, not distinct threads or cumulative migrations. All four binding/source series
+are emitted even at zero. Missing metrics or an unavailable scrape must not be interpreted as zero.
+
+To identify remaining threads without exposing capability URLs, run this query against a read-only
+connection to the bridge's SQLite database:
+
+```sql
+SELECT 'github' AS source, id, thread_id, webhook_binding
+FROM subscriptions WHERE webhook_binding = 'legacy'
+UNION ALL
+SELECT 'feed', id, thread_id, webhook_binding
+FROM feed_subscriptions WHERE webhook_binding = 'legacy'
+ORDER BY thread_id, source, id;
+```
+
+Before retiring the old path:
+
+1. Verify a canary thread receives events on its own webhook, including after its orb sleeps/resumes.
+2. Reload or explicitly reconcile every remaining legacy thread. Keep legacy compatibility while
+   dormant threads still need it. Review `subscription_removed` and `subscription_unsubscribed` logs:
+   deletion lowers the gauge too, so zero does not prove every previous subscription migrated.
+3. Confirm fresh scrapes stay at zero across the intended instances and account for any events
+   queued at old Amp registrations. The bridge cannot inspect or prove those queues are drained.
+4. Set `AMP_ALLOW_LEGACY_WEBHOOKS=false` on the bridge to reject legacy/omitted bindings on both
+   subscription POST routes and `PUT /api/webhook` with HTTP 409. Watch `legacy_webhook_rejected`
+   logs for old clients that need updating before removing legacy code in a later release.
+
+The switch defaults to `true`; it neither deletes old subscriptions nor unregisters Amp webhooks.
+There is no automatic deadline for dormant instances. Do not roll back to a pre-tracking backend
+while relying on these counts: its updates can change a URL without clearing `thread_v1`. After such
+a rollback, re-establish binding state before using the gauge as a retirement signal.
 
 When upgrading from a version that does not include an authenticated target thread in forwarded
 events, deploy the bridge before updating the plugin. The bridge field is additive, so the old
@@ -210,6 +253,30 @@ Fly.io, the included `fly.toml` keeps that port off the public service and confi
 [custom metrics scraping](https://fly.io/docs/reference/metrics/#custom-metrics) to pick it up
 automatically. On other hosts, restrict access to the metrics port with your firewall or network
 configuration. A ready-to-import Grafana dashboard for these metrics lives in [`dashboards/`](dashboards/README.md).
+
+### Diagnosing delivery problems
+
+Bridge stdout/stderr includes structured JSON events:
+
+- `subscription_registered`, `subscription_unsubscribed`: source, authenticated thread ID and
+  subscription ID; registration includes the binding version.
+- `webhook_binding_updated`: thread ID, binding version, endpoint SHA-256 fingerprint and changed
+  GitHub/feed row counts. Repeated startup updates report zero changed rows.
+- `legacy_webhook_rejected`: a retired client attempted a legacy binding write.
+- `github_webhook_processed`: GitHub delivery GUID, event type, normalized event count, matched
+  subscription/event pairs, deduplicated, suppressed, delivered, failed and removed counts. This
+  distinguishes zero matches from a retry that was already accepted.
+- `webhook_delivery_failed`, `subscription_removed`: subscription/thread IDs, binding version,
+  exact HTTP status (or `null` for a transport failure), reason, idempotency key, endpoint host/hash
+  and bounded `x-request-id`/`fly-request-id` response headers. These correlate a failed GitHub
+  delivery or feed entry with Amp diagnostics without logging capability URLs or response bodies.
+
+An HTTP 2xx counted as `delivered` means Amp accepted the request, not that a message was appended
+or the thread woke. For that boundary, use Amp's handler traces: the plugin logs webhook receipt
+with the Amp event ID and owner/orb thread IDs, then its existing delivery/suppression decisions.
+These plugin logs may be trace span events rather than durable local log files; their absence from
+a file is not evidence the handler did not run. Preserve bridge logs externally if you need history
+beyond the hosting provider's retention window; deletion still cascades the SQLite delivery ledger.
 
 The included `fly.toml` shows one Fly.io deployment. Before deploying a copy, change its app name,
 region, and OIDC audience, then create the app and set its secrets:

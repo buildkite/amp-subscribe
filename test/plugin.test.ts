@@ -203,7 +203,7 @@ async function captureWebhookHandler(
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     expect(fetchSpy.mock.calls[0]![0]).toBe("https://bridge.example.test/api/webhook")
     expect(fetchSpy.mock.calls[0]![1]).toMatchObject({
-      method: "PUT", body: JSON.stringify({ webhookUrl: `https://hooks.example.test/github-pr-events:${threadID}` }),
+      method: "PUT", body: JSON.stringify({ webhookUrl: `https://hooks.example.test/github-pr-events:${threadID}`, webhookBinding: "thread_v1" }),
     })
   } finally {
     fetchSpy.mockRestore()

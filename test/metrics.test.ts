@@ -41,8 +41,69 @@ describe("metrics", () => {
     expect(text).toContain('amp_subscribe_subscriptions{target_type="branch"} 0')
     expect(text).toContain('amp_subscribe_subscriptions{target_type="repository"} 0')
     expect(text).toContain("amp_subscribe_feed_subscriptions 0")
+    expect(text).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="github"} 0')
+    expect(text).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="feed"} 0')
     expect(text).toContain('amp_subscribe_webhook_deliveries_total{outcome="delivered"} 0')
     expect(text).toContain("amp_subscribe_webhook_signature_failures_total 0")
+  })
+
+  test("binding gauges track current state, including old-client regressions and deletion", async () => {
+    const app = createSubscriptionBridge({ ...config, fetchFeed: async () => ({
+      feed: { title: "Status", entries: [] }, etag: null, lastModified: null,
+    }) })
+    openBridges.push(app)
+    const githubInput = {
+      repository: "lox/project", pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/shared", events: ["reviews"], behavior: "notify",
+    }
+    const feedInput = { feedUrl: "https://status.example/feed", webhookUrl: githubInput.webhookUrl, behavior: "notify" }
+    const feedRequest = (body: unknown) => new Request("https://bridge.test/api/feed-subscriptions", {
+      method: "POST", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify(body),
+    })
+    await app.fetch(apiRequest(githubInput))
+    await app.fetch(apiRequest({ ...githubInput, pullRequestNumber: 18 }))
+    await app.fetch(feedRequest(feedInput))
+    const textBefore = await app.metrics().text()
+    expect(textBefore).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="github"} 2')
+    expect(textBefore).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="feed"} 1')
+    for (let reload = 0; reload < 2; reload += 1) {
+      expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
+        method: "PUT", headers: { authorization: "Bearer oidc-token" },
+        body: JSON.stringify({ webhookUrl: "https://hooks.example.test/thread", webhookBinding: "thread_v1" }),
+      }))).status).toBe(204)
+    }
+    const migrated = await app.metrics().text()
+    expect(migrated).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="github"} 0')
+    expect(migrated).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="github"} 2')
+    expect(migrated).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="feed"} 1')
+    // Old plugins omit the binding on upsert; never leave the previous migrated marker behind.
+    await app.fetch(apiRequest(githubInput))
+    await app.fetch(feedRequest(feedInput))
+    const regressed = await app.metrics().text()
+    expect(regressed).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="github"} 1')
+    expect(regressed).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="github"} 1')
+    expect(regressed).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="feed"} 1')
+    await app.fetch(apiRequest({ ...githubInput, webhookBinding: "thread_v1" }))
+    await app.fetch(feedRequest({ ...feedInput, webhookBinding: "thread_v1" }))
+    expect(app.database.list("T-test").every((row) => row.webhookBinding === "thread_v1")).toBe(true)
+    expect(app.database.listFeeds("T-test")[0]?.webhookBinding).toBe("thread_v1")
+    // An older caller of the migration endpoint must also clear the marker.
+    expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
+      method: "PUT", headers: { authorization: "Bearer oidc-token" },
+      body: JSON.stringify({ webhookUrl: githubInput.webhookUrl }),
+    }))).status).toBe(204)
+    expect(app.database.list("T-test").every((row) => row.webhookBinding === "legacy")).toBe(true)
+    expect(app.database.listFeeds("T-test")[0]?.webhookBinding).toBe("legacy")
+    for (const row of app.database.list("T-test")) app.database.delete("T-test", row.id)
+    for (const row of app.database.listFeeds("T-test")) app.database.deleteFeed("T-test", row.id)
+    const empty = await app.metrics().text()
+    for (const source of ["github", "feed"]) {
+      for (const binding of ["legacy", "thread_v1"]) {
+        expect(empty).toContain(`amp_subscribe_webhook_bindings{binding="${binding}",source="${source}"} 0`)
+      }
+    }
+    expect(empty).not.toContain("T-test")
+    expect(empty).not.toContain("https://")
   })
 
   test("reflects current subscription counts by target type", async () => {
