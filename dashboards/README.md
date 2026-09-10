@@ -50,8 +50,10 @@ URL labels.
 
 Zero means no **retained legacy subscription rows**, not that all old threads migrated or Amp's
 old webhook queues drained. Deletions also lower it. Follow the README's
-[retirement procedure](../README.md#tracking-completion-and-retiring-legacy-clients), including
-reconciling removal logs and dormant threads, before disabling legacy clients.
+[retirement procedure](../README.md#upgrading-an-existing-bridge), including reconciling removal
+logs and dormant threads and closing old-client writes before the final zero check. The
+thread-only bridge retains these series for rollout/rollback diagnostics but does not accept or
+migrate legacy subscriptions.
 
 ## Keeping this file in sync
 

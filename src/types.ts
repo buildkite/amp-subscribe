@@ -12,7 +12,7 @@ export const subscriptionEvents = [
 
 export type SubscriptionEvent = (typeof subscriptionEvents)[number]
 export type SubscriptionBehavior = "notify" | "investigate" | "implement"
-export type WebhookBinding = "legacy" | "thread_v1"
+export type WebhookBinding = "thread_v1"
 
 export const checkStatuses = ["requested", "waiting", "pending", "queued", "in_progress", "completed"] as const
 export const checkConclusions = [

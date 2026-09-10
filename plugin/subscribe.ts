@@ -49,14 +49,11 @@ function repositoryFromRemote(remote: string): string | null {
 }
 
 export function bridgeConfiguration(environment: Record<string, string | undefined>) {
-  const url = environment.AMP_SUBSCRIBE_URL ?? environment.AMP_GITHUB_RELAY_URL
+  const url = environment.AMP_SUBSCRIBE_URL
   if (!url) throw new Error("AMP_SUBSCRIBE_URL is required")
-  const legacyUrlSelected = !environment.AMP_SUBSCRIBE_URL
   return {
     url: url.replace(/\/$/, ""),
-    audience: environment.AMP_SUBSCRIBE_AUDIENCE
-      ?? environment.AMP_GITHUB_RELAY_AUDIENCE
-      ?? (legacyUrlSelected ? "urn:lox:amp-github-relay" : "urn:lox:amp-subscribe"),
+    audience: environment.AMP_SUBSCRIBE_AUDIENCE ?? "urn:lox:amp-subscribe",
   }
 }
 
@@ -381,7 +378,6 @@ function promptMetadata(payload: JsonObject): JsonObject {
   const pullRequestHeadSha = sha(pullRequest?.headSha)
   const targetThread = threadID(payload.targetThreadID)
   const targetType = enumValue(payload.targetType, ["pull_request", "branch", "repository"] as const)
-    ?? (pullRequest ? "pull_request" : undefined)
   const validTarget = targetType === "pull_request"
     ? !!pullRequestNumber && pullRequestUrl === canonicalPullRequestUrl && !branch && !subject
     : targetType === "branch"
@@ -397,7 +393,7 @@ function promptMetadata(payload: JsonObject): JsonObject {
       : githubEvent !== "push" && githubEvent !== "issues"
   if (payload.schemaVersion !== 1 || !deliveryId || !githubEvent || !event || !action
     || !repositoryId || !fullName || !validTarget || !validEventTarget
-    || (payload.targetThreadID !== undefined && !targetThread)
+    || !targetThread
     || !eventMatchesGitHubEvent(githubEvent, event, action)) {
     throw new Error("Rejected malformed GitHub event")
   }
@@ -408,7 +404,7 @@ function promptMetadata(payload: JsonObject): JsonObject {
     event,
     action,
     targetType,
-    ...(targetThread ? { targetThreadID: targetThread } : {}),
+    targetThreadID: targetThread,
     repository: { id: repositoryId, fullName },
     ...(targetType === "pull_request"
       ? { pullRequest: {
@@ -708,7 +704,7 @@ function targetKey(metadata: JsonObject): string {
   const branch = object(metadata.branch)
   const subject = object(metadata.subject)
   const targetType = text(metadata, "targetType")!
-  return `${text(metadata, "targetThreadID") ?? "legacy"}:${text(repository, "fullName")}:${targetType}:${positiveInteger(pullRequest?.number)
+  return `${text(metadata, "targetThreadID")}:${text(repository, "fullName")}:${targetType}:${positiveInteger(pullRequest?.number)
     ?? text(branch ?? {}, "name")
     ?? `${text(subject ?? {}, "kind")}:${positiveInteger(subject?.number)}`}`
 }
@@ -1266,8 +1262,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
     },
   })
 
-  // Move this thread's existing GitHub and feed subscriptions off the shared URL
-  // without deleting subscriptions, delivery history, or feed baselines.
+  // Refresh this thread's endpoint without losing delivery history or feed baselines.
   await bridgeRequest(amp, "/api/webhook", {
     method: "PUT",
     body: JSON.stringify({ webhookUrl, webhookBinding: "thread_v1" }),

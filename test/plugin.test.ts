@@ -15,12 +15,16 @@ import ampSubscribe, {
 } from "../plugin/subscribe"
 
 describe("bridgeConfiguration", () => {
-  test("keeps the legacy audience for a legacy self-hosted URL", () => {
-    expect(bridgeConfiguration({
+  test("does not use legacy URL or audience environment names", () => {
+    expect(() => bridgeConfiguration({
       AMP_GITHUB_RELAY_URL: "https://legacy.example/",
+    })).toThrow("AMP_SUBSCRIBE_URL is required")
+    expect(bridgeConfiguration({
+      AMP_SUBSCRIBE_URL: "https://subscribe.example/",
+      AMP_GITHUB_RELAY_AUDIENCE: "urn:custom:legacy-name",
     })).toEqual({
-      url: "https://legacy.example",
-      audience: "urn:lox:amp-github-relay",
+      url: "https://subscribe.example",
+      audience: "urn:lox:amp-subscribe",
     })
   })
 
@@ -34,11 +38,12 @@ describe("bridgeConfiguration", () => {
     })
     expect(bridgeConfiguration({
       AMP_SUBSCRIBE_URL: "https://subscribe.example",
+      AMP_SUBSCRIBE_AUDIENCE: "urn:custom:subscribe",
       AMP_GITHUB_RELAY_URL: "https://legacy.example",
       AMP_GITHUB_RELAY_AUDIENCE: "urn:custom:legacy-name",
     })).toEqual({
       url: "https://subscribe.example",
-      audience: "urn:custom:legacy-name",
+      audience: "urn:custom:subscribe",
     })
   })
 })
@@ -132,6 +137,8 @@ describe("instrumentPullRequestCreate", () => {
 
 const baseEvent = {
   schemaVersion: 1,
+  targetType: "pull_request",
+  targetThreadID: "T-target-thread",
   deliveryId: "delivery-1",
   githubEvent: "pull_request_review",
   event: "reviews",
@@ -241,6 +248,12 @@ function webhookInvocation(id: string, threadID = "T-target-thread") {
 }
 
 describe("eventPrompt", () => {
+  test("rejects old payloads without explicit target type or thread identity", () => {
+    for (const omitted of ["targetType", "targetThreadID"]) {
+      expect(() => eventPrompt({ ...baseEvent, [omitted]: undefined })).toThrow("Rejected malformed GitHub event")
+    }
+  })
+
   test("renders branch push events", () => {
     const prompt = eventPrompt({
       ...baseEvent,

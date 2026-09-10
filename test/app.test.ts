@@ -30,7 +30,7 @@ function bridge() {
   return instance
 }
 
-function apiRequest(body: unknown, method = "POST", threadID?: string) {
+function apiRequest(body: Record<string, unknown> | undefined, method = "POST", threadID?: string) {
   return new Request("https://bridge.test/api/subscriptions", {
     method,
     headers: {
@@ -38,11 +38,11 @@ function apiRequest(body: unknown, method = "POST", threadID?: string) {
       "content-type": "application/json",
       ...(threadID ? { "x-test-thread-id": threadID } : {}),
     },
-    body: method === "GET" ? undefined : JSON.stringify(body),
+    body: method === "GET" ? undefined : JSON.stringify({ targetType: "pull_request", webhookBinding: "thread_v1", ...body }),
   })
 }
 
-function feedApiRequest(body: unknown, method = "POST", threadID?: string) {
+function feedApiRequest(body: Record<string, unknown> | undefined, method = "POST", threadID?: string) {
   return new Request("https://bridge.test/api/feed-subscriptions", {
     method,
     headers: {
@@ -50,7 +50,7 @@ function feedApiRequest(body: unknown, method = "POST", threadID?: string) {
       "content-type": "application/json",
       ...(threadID ? { "x-test-thread-id": threadID } : {}),
     },
-    body: method === "GET" ? undefined : JSON.stringify(body),
+    body: method === "GET" ? undefined : JSON.stringify({ webhookBinding: "thread_v1", ...body }),
   })
 }
 
@@ -61,13 +61,12 @@ describe("subscription bridge", () => {
   })
 
   test("retirement rejects legacy writes on every binding route without changing subscriptions", async () => {
-    const app = createSubscriptionBridge({ ...config, allowLegacyWebhooks: false, fetchFeed: async () => ({
+    const app = createSubscriptionBridge({ ...config, fetchFeed: async () => ({
       feed: { title: "Status", entries: [] }, etag: null, lastModified: null,
     }) })
     openBridges.push(app)
-    const warn = spyOn(console, "warn").mockImplementation(() => {})
     const input = {
-      repository: "lox/project", pullRequestNumber: 17, events: ["reviews"], behavior: "notify",
+      repository: "lox/project", targetType: "pull_request", pullRequestNumber: 17, events: ["reviews"], behavior: "notify",
       feedUrl: "https://status.example/feed", webhookUrl: "https://hooks.example.test/thread-secret",
     }
     for (const [path, method, success] of [
@@ -78,17 +77,14 @@ describe("subscription bridge", () => {
       }))
       expect((await send("thread_v1")).status).toBe(success)
       const before = [app.database.list("T-test"), app.database.listFeeds("T-test")]
-      for (const binding of [undefined, "legacy"]) expect((await send(binding, "https://hooks.example.test/shared")).status).toBe(409)
-      for (const binding of [null, "future", 1]) expect((await send(binding)).status).toBe(400)
+      for (const binding of [undefined, "legacy", null, "future", 1]) {
+        expect((await send(binding, "https://hooks.example.test/shared")).status).toBe(400)
+      }
       expect([app.database.list("T-test"), app.database.listFeeds("T-test")]).toEqual(before)
     }
-    expect(warn.mock.calls).toHaveLength(6)
-    expect(warn.mock.calls.map(([line]) => JSON.parse(String(line))))
-      .toEqual(Array.from({ length: 6 }, () => expect.objectContaining({ event: "legacy_webhook_rejected", threadId: "T-test" })))
-    expect(JSON.stringify(warn.mock.calls)).not.toContain("https://")
   })
 
-  test("webhook migration authenticates and validates the replacement endpoint", async () => {
+  test("webhook refresh authenticates and validates the replacement endpoint", async () => {
     const app = bridge()
     expect((await app.fetch(new Request("https://bridge.test/api/webhook", { method: "PUT" }))).status).toBe(401)
     expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
@@ -96,13 +92,13 @@ describe("subscription bridge", () => {
     }))).status).toBe(405)
     for (const webhookUrl of [null, "http://hooks.example.test/secret", "https://other.test/secret"]) {
       const response = await app.fetch(new Request("https://bridge.test/api/webhook", {
-        method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl }),
+        method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl, webhookBinding: "thread_v1" }),
       }))
       expect(response.status).toBe(400)
     }
   })
 
-  test("migrates only the authenticated thread's subscriptions without losing history or feed baselines", async () => {
+  test("refreshes only the authenticated thread's subscriptions without losing history or feed baselines", async () => {
     const app = bridge()
     const info = spyOn(console, "info").mockImplementation(() => {})
     const baseline = { id: "entry-1", fingerprint: "version-1", title: null, url: null, publishedAt: null, updatedAt: null }
@@ -144,7 +140,7 @@ describe("subscription bridge", () => {
     expect(await listed.json()).toMatchObject({ subscriptions: [{ webhookBinding: "thread_v1" }] })
   })
 
-  test.each([404, 410])("a late %i from the old webhook cannot delete migrated GitHub or feed subscriptions", async (status) => {
+  test.each([404, 410])("a late %i from the old webhook cannot delete refreshed GitHub or feed subscriptions", async (status) => {
     const entry = { id: "entry-1", fingerprint: "version-1", title: null, url: null, publishedAt: null, updatedAt: null }
     const app = createSubscriptionBridge({ ...config, fetchFeed: async () => ({
       feed: { title: "Status", entries: [entry] }, etag: "new-etag", lastModified: null,
@@ -180,7 +176,7 @@ describe("subscription bridge", () => {
     await started.promise
     const replacement = "https://hooks.example.test/replacement"
     expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
-      method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl: replacement }),
+      method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl: replacement, webhookBinding: "thread_v1" }),
     }))).status).toBe(204)
     response.resolve(new Response(null, { status }))
     expect(await (await githubRequest).json()).toMatchObject({ failed: 1, removed: 0 })
@@ -209,7 +205,7 @@ describe("subscription bridge", () => {
     expect(app.database.list("T-attacker-controlled")).toHaveLength(0)
   })
 
-  test("routes and deduplicates shared-webhook GitHub subscriptions by authenticated thread", async () => {
+  test("routes and deduplicates per-thread GitHub subscriptions by authenticated thread", async () => {
     const app = bridge()
     const info = spyOn(console, "info").mockImplementation(() => {})
     for (const threadID of ["T-thread-one", "T-thread-two"]) {
@@ -217,7 +213,7 @@ describe("subscription bridge", () => {
         targetThreadID: "T-attacker-controlled",
         repository: "lox/project",
         pullRequestNumber: 17,
-        webhookUrl: "https://hooks.example.test/secret-capability",
+        webhookUrl: `https://hooks.example.test/secret-capability/${threadID}`,
         events: ["reviews"],
         behavior: "investigate",
       }, "POST", threadID))
@@ -434,6 +430,17 @@ describe("subscription bridge", () => {
     expect(await response.json()).toEqual({ error: "pull request subscriptions do not support issues" })
   })
 
+  test("does not infer a missing targetType from pullRequestNumber", async () => {
+    const app = bridge()
+    const response = await app.fetch(apiRequest({
+      repository: "lox/project", targetType: undefined, pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/thread", events: ["reviews"], behavior: "notify",
+    }))
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: "invalid targetType" })
+    expect(app.database.list("T-test")).toEqual([])
+  })
+
   test("rejects branch names containing prompt-shaping Unicode", async () => {
     const response = await bridge().fetch(apiRequest({
       repository: "lox/project",
@@ -512,7 +519,7 @@ describe("subscription bridge", () => {
       subscriptionId: subscription.id,
       threadId: "T-removal",
       subscriptionCreatedAt: subscription.createdAt,
-      webhookBinding: "legacy",
+      webhookBinding: "thread_v1",
       webhookHost: "hooks.example.test",
       webhookUrlHash: "adfa88b122d5500d7af22e6c9cc2b27f0645df7af7df1a1d3c92e04830809e3e",
       httpStatus: status,
