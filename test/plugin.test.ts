@@ -170,7 +170,6 @@ async function captureWebhookHandler(
   messages: (threadID: string) => Promise<unknown[]> = async () => [],
   threadID = "T-target-thread",
   registrationKeys: string[] = [],
-  username = "another-user",
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
   const previous = { AMP_ORB: process.env.AMP_ORB, AMP_THREAD_ID: process.env.AMP_THREAD_ID, AMP_SUBSCRIBE_URL: process.env.AMP_SUBSCRIBE_URL }
@@ -197,7 +196,6 @@ async function captureWebhookHandler(
       },
       threads: { get: () => { throw new Error("must not route to another thread") } },
       activeThread: { current: { id: "T-unrelated-ui-focus" } },
-      system: { user: { username } },
       on: () => undefined,
       registerTool: () => undefined,
       helpers: { shellCommandFromToolCall: () => null },
@@ -579,45 +577,50 @@ describe("webhook handler delivery", () => {
     expect(steer).toBe(false)
   })
 
-  test("applies per-subscription delivery mode before the user default", async () => {
+  test("applies explicit delivery modes instead of automatic urgency", async () => {
     const steering: Array<boolean | undefined> = []
     const append = async (_threadID: string, _message: unknown, options: { steer?: boolean }) => {
       steering.push(options.steer)
     }
 
-    const chrisHandler = await captureWebhookHandler(
-      append, undefined, undefined, undefined, "T-chris", undefined, "catkins-bk",
+    const queueHandler = await captureWebhookHandler(
+      append, undefined, undefined, undefined, "T-queue",
     )
-    const chrisEvent = webhookInvocation("chris-event", "T-chris")
-    chrisEvent.event.body = new TextEncoder().encode(JSON.stringify({
+    const queueEvent = webhookInvocation("queue-event", "T-queue")
+    queueEvent.event.body = new TextEncoder().encode(JSON.stringify({
       ...checkEvent("check_run", 400, "completed", "failure"),
-      targetThreadID: "T-chris",
+      targetThreadID: "T-queue",
       deliveryMode: "queue",
     }))
-    await chrisHandler(chrisEvent.event, chrisEvent.context)
+    await queueHandler(queueEvent.event, queueEvent.context)
 
-    const otherHandler = await captureWebhookHandler(
-      append, undefined, undefined, undefined, "T-other", undefined, "another-user",
+    const steerHandler = await captureWebhookHandler(
+      append, undefined, undefined, undefined, "T-steer",
     )
-    const otherEvent = webhookInvocation("other-event", "T-other")
-    otherEvent.event.body = new TextEncoder().encode(JSON.stringify({
-      ...JSON.parse(new TextDecoder().decode(otherEvent.event.body)),
+    const steerEvent = webhookInvocation("steer-event", "T-steer")
+    steerEvent.event.body = new TextEncoder().encode(JSON.stringify({
+      ...JSON.parse(new TextDecoder().decode(steerEvent.event.body)),
       deliveryMode: "steer",
     }))
-    await otherHandler(otherEvent.event, otherEvent.context)
+    await steerHandler(steerEvent.event, steerEvent.context)
 
     expect(steering).toEqual([false, true])
   })
 
-  test("uses Chris's steering default for automatic delivery", async () => {
-    let steer: boolean | undefined
+  test("uses event urgency for automatic delivery", async () => {
+    const steering: boolean[] = []
     const handler = await captureWebhookHandler(
-      async (_threadID, _message, options) => { steer = options.steer },
-      undefined, undefined, undefined, "T-chris", undefined, "catkins-bk",
+      async (_threadID, _message, options) => { steering.push(options.steer ?? false) },
     )
-    const invocation = webhookInvocation("automatic-chris-event", "T-chris")
-    await handler(invocation.event, invocation.context)
-    expect(steer).toBe(true)
+    const routine = webhookInvocation("automatic-routine-event")
+    await handler(routine.event, routine.context)
+    const failure = webhookInvocation("automatic-failure-event")
+    failure.event.body = new TextEncoder().encode(JSON.stringify({
+      ...checkEvent("check_run", 401, "completed", "failure"),
+      targetThreadID: "T-target-thread",
+    }))
+    await handler(failure.event, failure.context)
+    expect(steering).toEqual([false, true])
   })
 
   test("delivers each thread's feed events without passing them through GitHub coalescing", async () => {

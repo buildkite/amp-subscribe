@@ -26,7 +26,6 @@ const automaticPullRequestEvents = [
   "closed",
 ]
 const defaultBranchEvents = ["commits", "checks"]
-const githubEventSteeringUsernames = new Set(["catkins-bk"])
 const deliveryModes = ["automatic", "queue", "steer"] as const
 type DeliveryMode = (typeof deliveryModes)[number]
 
@@ -1188,7 +1187,6 @@ export default async function ampSubscribe(amp: PluginAPI) {
   const pullRequestCreateMarkers = new Map<string, string>()
   const coalescer = new GitHubEventCoalescer()
   const pendingDeliveries = new PendingThreadDeliveryDeduplicator()
-  const steerGitHubEvents = githubEventSteeringUsernames.has(amp.system.user?.username ?? "")
   const seen = new Set<string>()
   const executions = new Map<string, Promise<void>>()
   const counters = { received: 0, delivered: 0, suppressed: 0, batched: 0 }
@@ -1242,7 +1240,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
             : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
             const steer = deliveryMode === "steer"
-              || (deliveryMode === "automatic" && (steerGitHubEvents || delivery.urgent))
+              || (deliveryMode === "automatic" && delivery.urgent)
             if (!await pendingDeliveries.append(targetThread, delivery, steer)) {
               counters.suppressed += 1
               ctx.logger.log("GitHub event suppressed", {

@@ -194,9 +194,8 @@ used when feeds provide ETag or Last-Modified headers.
 
 The bridge drops queued and in-progress check lifecycle events before they consume durable webhook
 capacity. GitHub subscriptions accept a delivery mode: `queue` never steers, `steer` always steers,
-and `automatic` applies the plugin default. Automatic delivery steers every GitHub event for Chris
-Atkins (`catkins-bk`); for other users it only steers terminal failures and queues routine events.
-Existing subscriptions default to `automatic`. For pull requests, a successful check
+and `automatic` only steers terminal failures while queuing routine events. Existing subscriptions
+default to `automatic`. For pull requests, a successful check
 triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
 GitHub's current status rollup has passed. Branch check successes retain short-window batching. The
