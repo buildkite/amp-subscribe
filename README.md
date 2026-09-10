@@ -80,76 +80,75 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
 Keep the plugin filename `subscribe.ts` when upgrading. Amp includes the plugin identity in its
 durable webhook URLs, so renaming it would disconnect existing subscriptions.
 
-### Upgrade from a shared webhook
+### Thread-owned webhooks only
 
-Deploy the updated bridge **before** updating the plugin. On startup, the plugin registers
-`github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with
-`{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`.
-The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
-subscriptions to the new URL. Subscription IDs, behaviors, event filters, delivery history, and
-feed baselines are preserved. Startup adds a `webhook_binding` column to both subscription tables,
-defaulting existing rows to `legacy`. Repeated plugin loads use the same key
-and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
-until the bridge is upgraded and the plugin is reloaded.
+The bridge accepts only `webhookBinding: "thread_v1"` on both subscription POST routes and
+`PUT /api/webhook`; omitted, `legacy`, or unknown bindings return HTTP 400 without changing stored
+subscriptions. GitHub subscriptions also require explicit `targetType`. The plugin uses only
+`AMP_SUBSCRIBE_URL` and `AMP_SUBSCRIBE_AUDIENCE`; `AMP_GITHUB_RELAY_*` names are no longer read.
+There is no compatibility switch in this release.
 
-Reload the updated plugin in each subscribed thread to migrate it; dormant threads remain on the
-old endpoint until their plugin starts. The old shared webhook is not deleted because other threads
-may still use it. Do not roll back the plugin in migrated threads: that would restore shared URLs.
-Subscriptions already deleted by the old relay must be recreated. Events missed before or during
-the transition, including events queued at the old Amp registration, may need manual GitHub
-redelivery after migration. This change adds no retry queue or indefinite event retention; existing
-HTTP 404/410 removal behavior remains, except that a late response from a replaced URL cannot remove
-the migrated subscription. Archiving a subscribing thread can still stop its own notifications.
+On startup the plugin registers `github-pr-events:<AMP_THREAD_ID>` and refreshes the authenticated
+thread's endpoint using `PUT /api/webhook` with
+`{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`. This remains useful when a thread's
+capability URL changes: the bridge atomically updates that thread's GitHub and feed subscriptions
+without losing IDs, event filters, behavior, delivery history, or feed baselines. Repeated loads
+reuse the same key and safely repeat the refresh. Late HTTP 404/410 responses from replaced URLs
+cannot delete refreshed subscriptions. Archiving a thread can still stop its own notifications.
 
-#### Tracking completion and retiring legacy clients
+Binding versions remain client-declared metadata, not independent proof of Amp ownership or wakeup.
+The handler requires a trusted target thread matching its registration owner; GitHub payloads also
+require explicit `targetType`. No shared-key or missing-target fallback remains.
 
-The plugin declares `webhookBinding: "thread_v1"` on migration and new subscriptions. The bridge
-persists it and returns it in subscription lists. Omitted bindings mean `legacy`, including on
-updates: an old plugin writing a shared URL clears the migrated marker. This is a client-declared
-version, not independent proof of Amp webhook ownership, handler execution, or successful wakeup.
+#### Upgrading an existing bridge
 
-Watch `amp_subscribe_webhook_bindings{binding="legacy"}` for both `source="github"` and
-`source="feed"`; [dashboard queries](dashboards/README.md#webhook-migration) are provided. It counts
-current subscriptions, not distinct threads or cumulative migrations. All four binding/source series
-are emitted even at zero. Missing metrics or an unavailable scrape must not be interpreted as zero.
+Do not deploy this release while legacy subscriptions remain. Older databases must first run the
+[binding-tracking release](https://github.com/buildkite/amp-subscribe/pull/28) and its per-thread
+plugin. Reload that plugin in subscribed threads; dormant threads migrate only when their plugin
+loads. Review removal/unsubscribe logs too: zero retained rows does not prove all historical
+subscriptions migrated, and the bridge cannot prove old Amp webhook queues drained. Missed events
+may need explicit GitHub redelivery; this release adds no replay queue.
 
-To identify remaining threads without exposing capability URLs, run this query against a read-only
-connection to the bridge's SQLite database:
+Use this retirement order:
 
-```sql
-SELECT 'github' AS source, id, thread_id, webhook_binding
-FROM subscriptions WHERE webhook_binding = 'legacy'
-UNION ALL
-SELECT 'feed', id, thread_id, webhook_binding
-FROM feed_subscriptions WHERE webhook_binding = 'legacy'
-ORDER BY thread_id, source, id;
-```
+1. Verify current per-thread delivery, including an orb sleep/resume, and reconcile remaining
+   dormant subscriptions. Do not delete rows just to reach zero.
+2. Confirm `amp_subscribe_webhook_bindings{binding="legacy"}` is explicitly zero for **both**
+   `source="github"` and `source="feed"` on every serving instance, with fresh successful scrapes
+   and `up=1`. Missing, partial, failed, or stale metrics are not zero.
+3. On the **previous binding-tracking release**, set `AMP_ALLOW_LEGACY_WEBHOOKS=false` on all
+   serving instances. This closes the race with an old client registering between the first zero
+   observation and deployment. Let in-flight requests finish, then repeat the fresh zero check and
+   corroborate against read-only SQLite counts immediately before shipping:
 
-Before retiring the old path:
+   ```sql
+   SELECT 'github' AS source, COUNT(*) AS remaining
+   FROM subscriptions WHERE webhook_binding IS NOT 'thread_v1'
+   UNION ALL
+   SELECT 'feed', COUNT(*) FROM feed_subscriptions WHERE webhook_binding IS NOT 'thread_v1';
+   ```
 
-1. Verify a canary thread receives events on its own webhook, including after its orb sleeps/resumes.
-2. Reload or explicitly reconcile every remaining legacy thread. Keep legacy compatibility while
-   dormant threads still need it. Review `subscription_removed` and `subscription_unsubscribed` logs:
-   deletion lowers the gauge too, so zero does not prove every previous subscription migrated.
-3. Confirm fresh scrapes stay at zero across the intended instances and account for any events
-   queued at old Amp registrations. The bridge cannot inspect or prove those queues are drained.
-4. Set `AMP_ALLOW_LEGACY_WEBHOOKS=false` on the bridge to reject legacy/omitted bindings on both
-   subscription POST routes and `PUT /api/webhook` with HTTP 409. Watch `legacy_webhook_rejected`
-   logs for old clients that need updating before removing legacy code in a later release.
+   If either count is nonzero, stop the retirement and reconcile it using the previous release.
+4. Only with that gate satisfied and CI green, merge and deploy this backend, preserving the app's
+   configuration, secrets, and storage. Check automatic deployment targets **before merging**:
+   this repository's `fly.toml` and GitHub Deploy workflow target `lox-amp-subscribe`, not
+   `bk-amp-subscribe`. A bk-only retirement requires an explicitly authorized safeguard against
+   that automatic deployment, then an explicit bk deployment using its live app configuration.
+5. Verify the deployed revision, health, subscription/delivery state, and fresh binding metrics.
+   Then publish the matching workspace plugin, preserving its `subscribe.ts` identity and existing
+   bridge URL/audience defaults, and reload it. Do not revert to a shared-webhook plugin.
 
-The switch defaults to `true`; it neither deletes old subscriptions nor unregisters Amp webhooks.
-There is no automatic deadline for dormant instances. Do not roll back to a pre-tracking backend
-while relying on these counts: its updates can change a URL without clearing `thread_v1`. After such
-a rollback, re-establish binding state before using the gauge as a retirement signal.
+The new backend refuses startup if either table contains non-`thread_v1` rows, binding tracking is
+absent, or old rollback rows lack target fields. It does not migrate, relabel, or delete those rows.
+Fully migrated databases open in place, preserving their delivery ledgers and feed baselines.
+Historical unused columns/defaults in existing SQLite tables are left on disk to avoid a destructive
+table rebuild; new tables have only the current schema and require `thread_v1`. The bridge never
+uses the historical PR-number column or writes omitted bindings. Rollback to pre-tracking or
+PR-only backends is unsupported.
 
-When upgrading from a version that does not include an authenticated target thread in forwarded
-events, deploy the bridge before updating the plugin. The bridge field is additive, so the old
-plugin tolerates it; the updated plugin rejects events without it rather than risk appending them to
-the wrong thread. Existing subscription rows already contain the required thread ID and do not need
-to be recreated.
-
-When migrating from `github-relay.ts`, remove the old plugin and recreate its subscriptions after
-installing `subscribe.ts`.
+The binding gauge still reports both sources and both versions (explicit zeroes included), so the
+[existing dashboard queries](dashboards/README.md#webhook-migration) remain useful for rollout and
+rollback diagnostics. These series count retained rows, not successful notifications.
 
 ### Response modes
 
@@ -206,8 +205,7 @@ message is already stacked for the agent, while allowing changed check or review
 update that the agent previously handled. The read covers the 20 most recent user/assistant
 messages, the maximum supported by one plugin API call.
 
-The pending-message check is plugin-side and does not change the bridge payload. The per-thread
-webhook migration does require the bridge update described above.
+The pending-message check is plugin-side and does not change the bridge payload.
 
 ## Self-hosting
 
@@ -262,7 +260,7 @@ Bridge stdout/stderr includes structured JSON events:
   subscription ID; registration includes the binding version.
 - `webhook_binding_updated`: thread ID, binding version, endpoint SHA-256 fingerprint and changed
   GitHub/feed row counts. Repeated startup updates report zero changed rows.
-- `legacy_webhook_rejected`: a retired client attempted a legacy binding write.
+- Invalid/omitted binding writes return HTTP 400 and appear in `amp_subscribe_api_requests_total`.
 - `github_webhook_processed`: GitHub delivery GUID, event type, normalized event count, matched
   subscription/event pairs, deduplicated, suppressed, delivered, failed and removed counts. This
   distinguishes zero matches from a retry that was already accepted.

@@ -13,7 +13,6 @@ import {
   type Subscription,
   type SubscriptionBehavior,
   type SubscriptionEvent,
-  type WebhookBinding,
 } from "./types"
 
 export interface SubscriptionBridgeConfig {
@@ -21,7 +20,6 @@ export interface SubscriptionBridgeConfig {
   githubWebhookSecret: string
   allowedWebhookHosts: string[]
   authenticate: (request: Request) => Promise<OrbIdentity>
-  allowLegacyWebhooks?: boolean
   fetchFeed?: (url: string, conditional?: { etag?: string | null; lastModified?: string | null }) => Promise<FetchedFeed>
 }
 
@@ -90,16 +88,6 @@ function validEvents(value: unknown): value is SubscriptionEvent[] {
 
 function validBehavior(value: unknown): value is SubscriptionBehavior {
   return value === "notify" || value === "investigate" || value === "implement"
-}
-
-function parseWebhookBinding(value: unknown): WebhookBinding | null {
-  if (value === undefined) return "legacy"
-  return value === "legacy" || value === "thread_v1" ? value : null
-}
-
-function rejectLegacyWebhook(threadId: string): Response {
-  console.warn(JSON.stringify({ event: "legacy_webhook_rejected", threadId, timestamp: new Date().toISOString() }))
-  return json({ error: "Legacy webhooks are disabled; update and reload the subscribe plugin" }, 409)
 }
 
 function validBranch(value: unknown): value is string {
@@ -184,15 +172,14 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     if (request.method === "POST") {
       const input = await request.json().catch(() => null) as Record<string, unknown> | null
       const repository = typeof input?.repository === "string" ? input.repository.toLowerCase() : ""
-      const targetType = input?.targetType ?? (input?.pullRequestNumber === undefined ? undefined : "pull_request")
+      const targetType = input?.targetType
       const pullRequestNumber = input?.pullRequestNumber
       const branch = input?.branch
       const webhookUrl = input?.webhookUrl
       const events = input?.events
       const behavior = input?.behavior
-      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
-      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
-      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
+      const webhookBinding = input?.webhookBinding
+      if (webhookBinding !== "thread_v1") return json({ error: "webhookBinding must be thread_v1; update and reload the subscribe plugin" }, 400)
       if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) return json({ error: "invalid repository" }, 400)
       if (targetType !== "pull_request" && targetType !== "branch" && targetType !== "repository") {
         return json({ error: "invalid targetType" }, 400)
@@ -225,10 +212,10 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         behavior,
       }
       const subscription = targetType === "pull_request"
-        ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number }, webhookBinding)
+        ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number })
         : targetType === "branch"
-          ? database.upsert({ ...common, targetType, branch: branch as string }, webhookBinding)
-          : database.upsert({ ...common, targetType }, webhookBinding)
+          ? database.upsert({ ...common, targetType, branch: branch as string })
+          : database.upsert({ ...common, targetType })
       console.info(JSON.stringify({ event: "subscription_registered", source: "github", threadId: identity.threadId,
         subscriptionId: subscription.id, webhookBinding, timestamp: new Date().toISOString() }))
       const { webhookUrl: _, ...safeSubscription } = subscription
@@ -256,13 +243,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     if (!identity) return json({ error: "unauthorized" }, 401)
     if (request.method !== "PUT") return json({ error: "method not allowed" }, 405)
     const input = await request.json().catch(() => null) as Record<string, unknown> | null
-    const webhookBinding = parseWebhookBinding(input?.webhookBinding)
-    if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
-    if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
+    const webhookBinding = input?.webhookBinding
+    if (webhookBinding !== "thread_v1") return json({ error: "webhookBinding must be thread_v1; update and reload the subscribe plugin" }, 400)
     if (typeof input?.webhookUrl !== "string" || !isAllowedWebhookUrl(input.webhookUrl, config.allowedWebhookHosts)) {
       return json({ error: "webhookUrl host is not allowed" }, 400)
     }
-    const changed = database.updateWebhook(identity.threadId, input.webhookUrl, webhookBinding)
+    const changed = database.updateWebhook(identity.threadId, input.webhookUrl)
     console.info(JSON.stringify({ event: "webhook_binding_updated", threadId: identity.threadId, webhookBinding,
       changed, webhookUrlHash: createHash("sha256").update(input.webhookUrl).digest("hex"),
       timestamp: new Date().toISOString() }))
@@ -347,7 +333,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
           continue
         }
         if (response.status === 404 || response.status === 410) {
-          // A late response from the shared endpoint must not delete a migrated subscription.
+          // A late response from a replaced endpoint must not delete the subscription.
           if (!database.delete(subscription.threadId, subscription.id, subscription.webhookUrl)) {
             failed += 1
             webhookDeliveriesTotal.inc({ outcome: "failed" })
@@ -397,9 +383,8 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       const feedUrl = input?.feedUrl
       const webhookUrl = input?.webhookUrl
       const behavior = input?.behavior
-      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
-      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
-      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
+      const webhookBinding = input?.webhookBinding
+      if (webhookBinding !== "thread_v1") return json({ error: "webhookBinding must be thread_v1; update and reload the subscribe plugin" }, 400)
       if (typeof feedUrl !== "string") return json({ error: "feedUrl is required" }, 400)
       if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
         return json({ error: "webhookUrl host is not allowed" }, 400)
@@ -423,7 +408,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         behavior,
         etag: fetched.etag,
         lastModified: fetched.lastModified,
-      }, fetched.feed.entries, webhookBinding)
+      }, fetched.feed.entries)
       console.info(JSON.stringify({ event: "subscription_registered", source: "feed", threadId: identity.threadId,
         subscriptionId: subscription.id, webhookBinding, timestamp: new Date().toISOString() }))
       const { webhookUrl: _, etag: __, lastModified: ___, ...safeSubscription } = subscription

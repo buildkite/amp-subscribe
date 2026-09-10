@@ -11,233 +11,126 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true })
 })
 
+// The deployed binding-tracking schema, including its historical nullable PR column
+// and legacy defaults. Do not derive this fixture from the new schema.
+function previousDatabase() {
+  const directory = mkdtempSync(join(tmpdir(), "amp-bindings-"))
+  directories.push(directory)
+  const path = join(directory, "relay.sqlite")
+  const sqlite = new Database(path, { create: true })
+  sqlite.exec(`
+    CREATE TABLE subscriptions (
+      id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, repository TEXT NOT NULL,
+      pull_request_number INTEGER,
+      target_type TEXT CHECK(target_type IN ('pull_request', 'branch', 'repository')),
+      target TEXT, webhook_url TEXT NOT NULL, events TEXT NOT NULL,
+      behavior TEXT NOT NULL, created_at TEXT NOT NULL,
+      webhook_binding TEXT NOT NULL DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1')),
+      UNIQUE(thread_id, repository, target_type, target),
+      UNIQUE(thread_id, repository, pull_request_number)
+    );
+    CREATE TABLE deliveries (
+      subscription_id TEXT NOT NULL, delivery_id TEXT NOT NULL, event TEXT NOT NULL,
+      delivered_at TEXT NOT NULL, PRIMARY KEY(subscription_id, delivery_id, event),
+      FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE feed_subscriptions (
+      id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, feed_url TEXT NOT NULL,
+      webhook_url TEXT NOT NULL, behavior TEXT NOT NULL, etag TEXT, last_modified TEXT,
+      created_at TEXT NOT NULL,
+      webhook_binding TEXT NOT NULL DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1')),
+      UNIQUE(thread_id, feed_url)
+    );
+    CREATE TABLE feed_entries (
+      subscription_id TEXT NOT NULL, entry_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+      seen_at TEXT NOT NULL, PRIMARY KEY(subscription_id, entry_id),
+      FOREIGN KEY(subscription_id) REFERENCES feed_subscriptions(id) ON DELETE CASCADE
+    );
+    INSERT INTO subscriptions VALUES ('gh', 'T-test', 'lox/project', 17, 'pull_request', '17',
+      'https://hooks.example.test/thread', '["reviews"]', 'implement', '2026-09-01', 'thread_v1');
+    INSERT INTO deliveries VALUES ('gh', 'delivery-1', 'reviews', '2026-09-02');
+    INSERT INTO feed_subscriptions VALUES ('feed', 'T-test', 'https://status.example/feed',
+      'https://hooks.example.test/thread', 'notify', 'etag-1', 'modified-1', '2026-09-01', 'thread_v1');
+    INSERT INTO feed_entries VALUES ('feed', 'entry-1', 'version-1', '2026-09-02');
+  `)
+  return { sqlite, path }
+}
+
 describe("SubscriptionDatabase", () => {
-  test("classifies old bindings conservatively and persists migration across restarts", () => {
-    const directory = mkdtempSync(join(tmpdir(), "amp-bindings-"))
-    directories.push(directory)
-    const path = join(directory, "relay.sqlite")
+  test("opens the fully migrated deployed schema and preserves subscriptions, history and feed baselines", () => {
+    const { sqlite, path } = previousDatabase()
+    sqlite.close()
     let database = new SubscriptionDatabase(path)
-    const github = database.upsert({
-      threadId: "T-test", repository: "lox/project", targetType: "branch", branch: "main",
-      webhookUrl: "https://hooks.example.test/shared", events: ["commits"], behavior: "notify",
-    })
-    const feed = database.upsertFeed({
-      threadId: "T-test", feedUrl: "https://status.example/feed", webhookUrl: github.webhookUrl,
-      behavior: "notify", etag: null, lastModified: null,
-    }, [])
-    database.markDelivered(github.id, "before-migration", "commits")
-    // Reproduce the schema deployed before binding tracking existed.
-    database.sqlite.exec("ALTER TABLE subscriptions DROP COLUMN webhook_binding; ALTER TABLE feed_subscriptions DROP COLUMN webhook_binding")
+    const github = database.list("T-test")[0]!
+    const feed = database.listFeeds("T-test")[0]!
+    expect(github).toMatchObject({ id: "gh", targetType: "pull_request", pullRequestNumber: 17, behavior: "implement" })
+    expect(feed).toMatchObject({ id: "feed", etag: "etag-1", lastModified: "modified-1" })
+    expect(database.upsert({ ...github, webhookUrl: "https://hooks.example.test/updated" }).id).toBe("gh")
+    // New PRs must work with the previous schema's extra unique PR-number column.
+    for (const pullRequestNumber of [18, 19]) {
+      database.upsert({ ...github, targetType: "pull_request", pullRequestNumber })
+    }
+    const url = "https://hooks.example.test/refreshed"
+    expect(database.updateWebhook("T-test", url)).toEqual({ github: 3, feed: 1 })
+    expect(database.updateWebhook("T-test", url)).toEqual({ github: 0, feed: 0 })
     database.close()
     database = new SubscriptionDatabase(path)
-    expect(database.list("T-test")[0]?.webhookBinding).toBe("legacy")
-    expect(database.listFeeds("T-test")[0]?.webhookBinding).toBe("legacy")
-    const url = "https://hooks.example.test/thread"
-    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 1, feed: 1 })
-    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 0, feed: 0 })
-    database.close()
-    database = new SubscriptionDatabase(path)
-    expect(database.list("T-test")[0]).toEqual({ ...github, webhookUrl: url, webhookBinding: "thread_v1" })
-    expect(database.listFeeds("T-test")[0]).toEqual({ ...feed, webhookUrl: url, webhookBinding: "thread_v1" })
-    expect(database.wasDelivered(github.id, "before-migration", "commits")).toBe(true)
-    database.close()
-  })
-
-  test("migrates existing pull request subscriptions and deliveries", () => {
-    const directory = mkdtempSync(join(tmpdir(), "amp-subscribe-"))
-    directories.push(directory)
-    const path = join(directory, "relay.sqlite")
-    const legacy = new Database(path, { create: true })
-    legacy.exec(`
-      CREATE TABLE subscriptions (
-        id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        pull_request_number INTEGER NOT NULL,
-        webhook_url TEXT NOT NULL,
-        events TEXT NOT NULL,
-        behavior TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(thread_id, repository, pull_request_number)
-      );
-      CREATE TABLE deliveries (
-        subscription_id TEXT NOT NULL,
-        delivery_id TEXT NOT NULL,
-        event TEXT NOT NULL,
-        delivered_at TEXT NOT NULL,
-        PRIMARY KEY(subscription_id, delivery_id, event),
-        FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-      );
-      INSERT INTO subscriptions VALUES
-        ('sub-1', 'T-test', 'lox/project', 17, 'https://hooks.example.test/secret',
-          '["reviews"]', 'investigate', '2026-08-23T00:00:00.000Z');
-      INSERT INTO deliveries VALUES ('sub-1', 'delivery-1', 'reviews', '2026-08-23T00:01:00.000Z');
-    `)
-    legacy.close()
-
-    const database = new SubscriptionDatabase(path)
-    expect(database.list("T-test")).toEqual([{
-      id: "sub-1",
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "pull_request",
-      pullRequestNumber: 17,
-      webhookUrl: "https://hooks.example.test/secret",
-      webhookBinding: "legacy",
-      events: ["reviews"],
-      behavior: "investigate",
-      createdAt: "2026-08-23T00:00:00.000Z",
-    }])
-    expect(database.wasDelivered("sub-1", "delivery-1", "reviews")).toBe(true)
+    expect(database.matching("lox/project", "pull_request", "17", "reviews"))
+      .toEqual([{ ...github, webhookUrl: url }])
+    expect(database.listFeeds("T-test")).toEqual([{ ...feed, webhookUrl: url }])
+    expect(database.wasDelivered("gh", "delivery-1", "reviews")).toBe(true)
+    expect(database.feedEntryChanged("feed", {
+      id: "entry-1", fingerprint: "version-1", title: null, url: null, publishedAt: null, updatedAt: null,
+    })).toBe(false)
+    expect(database.sqlite.query("PRAGMA foreign_key_check").all()).toEqual([])
+    database.delete("T-test", "gh")
+    database.deleteFeed("T-test", "feed")
+    expect(database.sqlite.query("SELECT * FROM deliveries").all()).toEqual([])
+    expect(database.sqlite.query("SELECT * FROM feed_entries").all()).toEqual([])
     database.close()
   })
 
-  test("supports rollback writes and adopts them after rolling forward", () => {
-    const directory = mkdtempSync(join(tmpdir(), "amp-subscribe-"))
-    directories.push(directory)
-    const path = join(directory, "relay.sqlite")
-    const database = new SubscriptionDatabase(path)
-    database.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "branch",
-      branch: "main",
-      webhookUrl: "https://hooks.example.test/branch",
-      events: ["commits"],
-      behavior: "notify",
-    })
-    database.close()
-
-    const rollback = new Database(path)
-    expect(rollback.query<{ pull_request_number: number | null }, []>(`
-      SELECT pull_request_number FROM subscriptions WHERE target_type = 'branch'
-    `).get()?.pull_request_number).toBeNull()
-    rollback.query(`
-      INSERT INTO subscriptions
-        (id, thread_id, repository, pull_request_number, webhook_url, events, behavior, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(thread_id, repository, pull_request_number) DO UPDATE SET
-        webhook_url = excluded.webhook_url, events = excluded.events, behavior = excluded.behavior
-    `).run(
-      "legacy-sub",
-      "T-test",
-      "lox/project",
-      18,
-      "https://hooks.example.test/legacy",
-      '["reviews"]',
-      "investigate",
-      "2026-08-23T00:00:00.000Z",
-    )
-    rollback.close()
-
-    const rolledForward = new SubscriptionDatabase(path)
-    expect(rolledForward.matching("lox/project", "pull_request", "18", "reviews"))
-      .toHaveLength(1)
-    rolledForward.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "pull_request",
-      pullRequestNumber: 19,
-      webhookUrl: "https://hooks.example.test/current",
-      events: ["reviews"],
-      behavior: "investigate",
-    })
-    expect(rolledForward.countSubscriptionsByTargetType()).toContainEqual({
-      targetType: "pull_request",
-      count: 2,
-    })
-    const adopted = rolledForward.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "pull_request",
-      pullRequestNumber: 18,
-      webhookUrl: "https://hooks.example.test/current",
-      events: ["reviews"],
-      behavior: "investigate",
-    })
-    expect(adopted.id).toBe("legacy-sub")
-    expect(rolledForward.list("T-test")).toContainEqual(adopted)
-    rolledForward.close()
+  test.each(["subscriptions", "feed_subscriptions"])("refuses remaining legacy rows in %s without mutating them", (table) => {
+    const { sqlite, path } = previousDatabase()
+    sqlite.exec(`UPDATE ${table} SET webhook_binding = 'legacy'`)
+    const before = sqlite.query(`SELECT * FROM ${table}`).all()
+    sqlite.close()
+    expect(() => new SubscriptionDatabase(path)).toThrow("finish thread_v1 migration")
+    const check = new Database(path, { readonly: true })
+    expect(check.query(`SELECT * FROM ${table}`).all()).toEqual(before)
+    expect(check.query("SELECT * FROM deliveries").all()).toHaveLength(1)
+    expect(check.query("SELECT * FROM feed_entries").all()).toHaveLength(1)
+    check.close()
   })
 
-  test("migrates the branch-capable schema to support repository targets", () => {
-    const directory = mkdtempSync(join(tmpdir(), "amp-subscribe-"))
-    directories.push(directory)
-    const path = join(directory, "relay.sqlite")
-    const previous = new Database(path, { create: true })
-    previous.exec(`
-      CREATE TABLE subscriptions (
-        id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        pull_request_number INTEGER,
-        target_type TEXT CHECK(target_type IN ('pull_request', 'branch')),
-        target TEXT,
-        webhook_url TEXT NOT NULL,
-        events TEXT NOT NULL,
-        behavior TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(thread_id, repository, target_type, target),
-        UNIQUE(thread_id, repository, pull_request_number)
-      );
-      CREATE TABLE deliveries (
-        subscription_id TEXT NOT NULL,
-        delivery_id TEXT NOT NULL,
-        event TEXT NOT NULL,
-        delivered_at TEXT NOT NULL,
-        PRIMARY KEY(subscription_id, delivery_id, event),
-        FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-      );
-      INSERT INTO subscriptions VALUES
-        ('sub-branch', 'T-test', 'lox/project', NULL, 'branch', 'main',
-          'https://hooks.example.test/branch', '["commits"]', 'notify', '2026-08-23T00:00:00.000Z');
-      INSERT INTO deliveries VALUES
-        ('sub-branch', 'delivery-branch', 'commits', '2026-08-23T00:01:00.000Z');
-    `)
-    previous.close()
-
-    const database = new SubscriptionDatabase(path)
-    expect(database.list("T-test")).toEqual([expect.objectContaining({
-      id: "sub-branch",
-      targetType: "branch",
-      branch: "main",
-    })])
-    expect(database.wasDelivered("sub-branch", "delivery-branch", "commits")).toBe(true)
-    expect(database.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "repository",
-      webhookUrl: "https://hooks.example.test/repository",
-      events: ["issues"],
-      behavior: "notify",
-    })).toMatchObject({ targetType: "repository", repository: "lox/project" })
-    database.close()
+  test.each([
+    "ALTER TABLE subscriptions DROP COLUMN webhook_binding",
+    "ALTER TABLE feed_subscriptions DROP COLUMN webhook_binding",
+    "UPDATE subscriptions SET target_type = NULL, target = NULL",
+  ])("refuses pre-tracking schemas and rollback rows: %s", (change) => {
+    const { sqlite, path } = previousDatabase()
+    sqlite.exec(change)
+    sqlite.close()
+    expect(() => new SubscriptionDatabase(path)).toThrow("finish thread_v1 migration")
   })
 
   test("stores and matches one repository subscription per thread and repository", () => {
     const database = new SubscriptionDatabase(":memory:")
     const subscription = database.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "repository",
-      webhookUrl: "https://hooks.example.test/repository",
-      events: ["pull_requests", "issues"],
-      behavior: "notify",
+      threadId: "T-test", repository: "lox/project", targetType: "repository",
+      webhookUrl: "https://hooks.example.test/repository", events: ["pull_requests", "issues"], behavior: "notify",
     })
     expect(database.list("T-test")).toEqual([subscription])
     expect(database.matching("LOX/PROJECT", "repository", "*", "issues")).toEqual([subscription])
     expect(database.matching("lox/project", "repository", "*", "reviews")).toEqual([])
-
     const updated = database.upsert({
-      threadId: "T-test",
-      repository: "lox/project",
-      targetType: "repository",
-      webhookUrl: "https://hooks.example.test/updated",
-      events: ["issues"],
-      behavior: "investigate",
+      threadId: "T-test", repository: "lox/project", targetType: "repository",
+      webhookUrl: "https://hooks.example.test/updated", events: ["issues"], behavior: "investigate",
     })
     expect(updated.id).toBe(subscription.id)
     expect(database.list("T-test")).toEqual([updated])
+    expect(() => database.sqlite.exec("UPDATE subscriptions SET webhook_binding = 'legacy'"))
+      .toThrow("CHECK constraint failed")
     database.close()
   })
 })
