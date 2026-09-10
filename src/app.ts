@@ -13,6 +13,7 @@ import {
   type Subscription,
   type SubscriptionBehavior,
   type SubscriptionEvent,
+  type WebhookBinding,
 } from "./types"
 
 export interface SubscriptionBridgeConfig {
@@ -20,6 +21,7 @@ export interface SubscriptionBridgeConfig {
   githubWebhookSecret: string
   allowedWebhookHosts: string[]
   authenticate: (request: Request) => Promise<OrbIdentity>
+  allowLegacyWebhooks?: boolean
   fetchFeed?: (url: string, conditional?: { etag?: string | null; lastModified?: string | null }) => Promise<FetchedFeed>
 }
 
@@ -46,26 +48,25 @@ function json(value: unknown, status = 200): Response {
   return Response.json(value, { status })
 }
 
-function logWebhookRemoval(
-  subscription: Pick<Subscription, "id" | "threadId" | "createdAt" | "webhookUrl">,
-  response: Response,
+function logWebhookOutcome(
+  subscription: Pick<Subscription, "id" | "threadId" | "createdAt" | "webhookUrl" | "webhookBinding">,
+  response: Response | null,
   details: Record<string, unknown>,
 ): void {
   // Capability URLs and response bodies can contain credentials. Log only a
   // fingerprint and allowlisted response headers for cross-service correlation.
   console.warn(JSON.stringify({
     level: "warn",
-    event: "subscription_removed",
     timestamp: new Date().toISOString(),
-    reason: "webhook_not_found_or_gone",
     subscriptionId: subscription.id,
     threadId: subscription.threadId,
     subscriptionCreatedAt: subscription.createdAt,
+    webhookBinding: subscription.webhookBinding,
     webhookHost: new URL(subscription.webhookUrl).hostname,
     webhookUrlHash: createHash("sha256").update(subscription.webhookUrl).digest("hex"),
-    httpStatus: response.status,
-    requestId: response.headers.get("x-request-id")?.slice(0, 256) ?? null,
-    flyRequestId: response.headers.get("fly-request-id")?.slice(0, 256) ?? null,
+    httpStatus: response?.status ?? null,
+    requestId: response?.headers.get("x-request-id")?.slice(0, 256) ?? null,
+    flyRequestId: response?.headers.get("fly-request-id")?.slice(0, 256) ?? null,
     ...details,
   }))
 }
@@ -89,6 +90,16 @@ function validEvents(value: unknown): value is SubscriptionEvent[] {
 
 function validBehavior(value: unknown): value is SubscriptionBehavior {
   return value === "notify" || value === "investigate" || value === "implement"
+}
+
+function parseWebhookBinding(value: unknown): WebhookBinding | null {
+  if (value === undefined) return "legacy"
+  return value === "legacy" || value === "thread_v1" ? value : null
+}
+
+function rejectLegacyWebhook(threadId: string): Response {
+  console.warn(JSON.stringify({ event: "legacy_webhook_rejected", threadId, timestamp: new Date().toISOString() }))
+  return json({ error: "Legacy webhooks are disabled; update and reload the subscribe plugin" }, 409)
 }
 
 function validBranch(value: unknown): value is string {
@@ -118,6 +129,10 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
   const apiRequestsTotal = metrics.counter(
     "amp_subscribe_api_requests_total",
     "Subscription API requests, by route, method and response status.",
+  )
+  const webhookBindingsGauge = metrics.gauge(
+    "amp_subscribe_webhook_bindings",
+    "Current subscriptions by source and webhook binding version, not successful migrations.",
   )
   const webhookEventsReceivedTotal = metrics.counter(
     "amp_subscribe_webhook_events_received_total",
@@ -149,6 +164,13 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       subscriptionsGauge.set({ target_type: targetType }, counts.get(targetType) ?? 0)
     }
     feedSubscriptionsGauge.set({}, database.countFeedSubscriptions())
+    const bindings = database.countWebhookBindings()
+    for (const source of ["github", "feed"]) {
+      for (const binding of ["legacy", "thread_v1"]) {
+        webhookBindingsGauge.set({ source, binding },
+          bindings.find((row) => row.source === source && row.binding === binding)?.count ?? 0)
+      }
+    }
   }
 
   async function subscriptions(request: Request): Promise<Response> {
@@ -168,6 +190,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       const webhookUrl = input?.webhookUrl
       const events = input?.events
       const behavior = input?.behavior
+      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
+      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
+      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
       if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) return json({ error: "invalid repository" }, 400)
       if (targetType !== "pull_request" && targetType !== "branch" && targetType !== "repository") {
         return json({ error: "invalid targetType" }, 400)
@@ -200,10 +225,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         behavior,
       }
       const subscription = targetType === "pull_request"
-        ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number })
+        ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number }, webhookBinding)
         : targetType === "branch"
-          ? database.upsert({ ...common, targetType, branch: branch as string })
-          : database.upsert({ ...common, targetType })
+          ? database.upsert({ ...common, targetType, branch: branch as string }, webhookBinding)
+          : database.upsert({ ...common, targetType }, webhookBinding)
+      console.info(JSON.stringify({ event: "subscription_registered", source: "github", threadId: identity.threadId,
+        subscriptionId: subscription.id, webhookBinding, timestamp: new Date().toISOString() }))
       const { webhookUrl: _, ...safeSubscription } = subscription
       return json({ subscription: safeSubscription }, 201)
     }
@@ -213,12 +240,33 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       if (typeof input?.id !== "string") {
         return json({ error: "id is required" }, 400)
       }
-      return database.delete(identity.threadId, input.id)
+      const deleted = database.delete(identity.threadId, input.id)
+      if (deleted) console.info(JSON.stringify({ event: "subscription_unsubscribed", source: "github",
+        threadId: identity.threadId, subscriptionId: input.id, timestamp: new Date().toISOString() }))
+      return deleted
         ? new Response(null, { status: 204 })
         : json({ error: "subscription not found" }, 404)
     }
 
     return json({ error: "method not allowed" }, 405)
+  }
+
+  async function updateWebhook(request: Request): Promise<Response> {
+    const identity = await config.authenticate(request).catch(() => null)
+    if (!identity) return json({ error: "unauthorized" }, 401)
+    if (request.method !== "PUT") return json({ error: "method not allowed" }, 405)
+    const input = await request.json().catch(() => null) as Record<string, unknown> | null
+    const webhookBinding = parseWebhookBinding(input?.webhookBinding)
+    if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
+    if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
+    if (typeof input?.webhookUrl !== "string" || !isAllowedWebhookUrl(input.webhookUrl, config.allowedWebhookHosts)) {
+      return json({ error: "webhookUrl host is not allowed" }, 400)
+    }
+    const changed = database.updateWebhook(identity.threadId, input.webhookUrl, webhookBinding)
+    console.info(JSON.stringify({ event: "webhook_binding_updated", threadId: identity.threadId, webhookBinding,
+      changed, webhookUrlHash: createHash("sha256").update(input.webhookUrl).digest("hex"),
+      timestamp: new Date().toISOString() }))
+    return new Response(null, { status: 204 })
   }
 
   async function githubWebhook(request: Request): Promise<Response> {
@@ -248,6 +296,8 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     let delivered = 0
     let failed = 0
     let removed = 0
+    let matchedSubscriptions = 0
+    let deduplicated = 0
 
     for (const event of events) {
       const target = event.targetType === "pull_request"
@@ -264,7 +314,16 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         target,
         event.event,
       )) {
-        if (database.wasDelivered(subscription.id, deliveryId, event.event)) continue
+        matchedSubscriptions += 1
+        if (database.wasDelivered(subscription.id, deliveryId, event.event)) {
+          deduplicated += 1
+          continue
+        }
+        const deliveryLog = {
+          source: "github", repository: subscription.repository, targetType: subscription.targetType,
+          target, deliveryId, githubEvent: event.githubEvent, subscriptionEvent: event.event, action: event.action,
+          idempotencyKey: `${idempotencyKey}:${subscription.id}`,
+        }
         const forwardedBody = JSON.stringify({
           ...event,
           behavior: subscription.behavior,
@@ -284,27 +343,28 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         } catch {
           failed += 1
           webhookDeliveriesTotal.inc({ outcome: "failed" })
+          logWebhookOutcome(subscription, null, { ...deliveryLog, event: "webhook_delivery_failed", reason: "transport_error" })
           continue
         }
         if (response.status === 404 || response.status === 410) {
-          database.delete(subscription.threadId, subscription.id)
+          // A late response from the shared endpoint must not delete a migrated subscription.
+          if (!database.delete(subscription.threadId, subscription.id, subscription.webhookUrl)) {
+            failed += 1
+            webhookDeliveriesTotal.inc({ outcome: "failed" })
+            logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "subscription_changed_or_deleted" })
+            continue
+          }
           removed += 1
           webhookDeliveriesTotal.inc({ outcome: "removed" })
-          logWebhookRemoval(subscription, response, {
-            source: "github",
-            repository: subscription.repository,
-            targetType: subscription.targetType,
-            target,
-            deliveryId,
-            githubEvent: event.githubEvent,
-            subscriptionEvent: event.event,
-            action: event.action,
+          logWebhookOutcome(subscription, response, {
+            ...deliveryLog, event: "subscription_removed", reason: "webhook_not_found_or_gone",
           })
           continue
         }
         if (!response.ok) {
           failed += 1
           webhookDeliveriesTotal.inc({ outcome: "failed" })
+          logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "http_error" })
           continue
         }
         database.markDelivered(subscription.id, deliveryId, event.event)
@@ -312,6 +372,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         webhookDeliveriesTotal.inc({ outcome: "delivered" })
       }
     }
+    console.info(JSON.stringify({ event: "github_webhook_processed", deliveryId, githubEvent: eventName,
+      matchedEvents: events.length, matchedSubscriptions, deduplicated, delivered, failed, removed, suppressed,
+      timestamp: new Date().toISOString() }))
     if (failed > 0) {
       return json({ error: "Amp webhook delivery failed", failed, delivered, removed, suppressed }, 502)
     }
@@ -334,6 +397,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       const feedUrl = input?.feedUrl
       const webhookUrl = input?.webhookUrl
       const behavior = input?.behavior
+      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
+      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
+      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
       if (typeof feedUrl !== "string") return json({ error: "feedUrl is required" }, 400)
       if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
         return json({ error: "webhookUrl host is not allowed" }, 400)
@@ -357,7 +423,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         behavior,
         etag: fetched.etag,
         lastModified: fetched.lastModified,
-      }, fetched.feed.entries)
+      }, fetched.feed.entries, webhookBinding)
+      console.info(JSON.stringify({ event: "subscription_registered", source: "feed", threadId: identity.threadId,
+        subscriptionId: subscription.id, webhookBinding, timestamp: new Date().toISOString() }))
       const { webhookUrl: _, etag: __, lastModified: ___, ...safeSubscription } = subscription
       return json({ subscription: safeSubscription }, 201)
     }
@@ -365,7 +433,10 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     if (request.method === "DELETE") {
       const input = await request.json().catch(() => null) as Record<string, unknown> | null
       if (typeof input?.id !== "string") return json({ error: "id is required" }, 400)
-      return database.deleteFeed(identity.threadId, input.id)
+      const deleted = database.deleteFeed(identity.threadId, input.id)
+      if (deleted) console.info(JSON.stringify({ event: "subscription_unsubscribed", source: "feed",
+        threadId: identity.threadId, subscriptionId: input.id, timestamp: new Date().toISOString() }))
+      return deleted
         ? new Response(null, { status: 204 })
         : json({ error: "subscription not found" }, 404)
     }
@@ -414,6 +485,8 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
             behavior: subscription.behavior,
             targetThreadID: subscription.threadId,
           })
+          const deliveryLog = { source: "feed", entryFingerprint: entry.fingerprint,
+            idempotencyKey: `feed:${subscription.id}:${entry.fingerprint}` }
           let response: Response
           try {
             response = await fetch(subscription.webhookUrl, {
@@ -429,14 +502,21 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
             failed += 1
             feedFailed = true
             feedPollTotal.inc({ result: "failed" })
+            logWebhookOutcome(subscription, null, { ...deliveryLog, event: "webhook_delivery_failed", reason: "transport_error" })
             continue
           }
           if (response.status === 404 || response.status === 410) {
-            database.deleteFeed(subscription.threadId, subscription.id)
+            if (!database.deleteFeed(subscription.threadId, subscription.id, subscription.webhookUrl)) {
+              failed += 1
+              feedFailed = true
+              feedPollTotal.inc({ result: "failed" })
+              logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "subscription_changed_or_deleted" })
+              break
+            }
             removed += 1
             feedPollTotal.inc({ result: "removed" })
-            logWebhookRemoval(subscription, response, {
-              source: "feed",
+            logWebhookOutcome(subscription, response, {
+              ...deliveryLog, event: "subscription_removed", reason: "webhook_not_found_or_gone",
               feedHost: new URL(subscription.feedUrl).hostname,
               feedUrlHash: createHash("sha256").update(subscription.feedUrl).digest("hex"),
               entryFingerprint: entry.fingerprint,
@@ -447,6 +527,7 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
             failed += 1
             feedFailed = true
             feedPollTotal.inc({ result: "failed" })
+            logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "http_error" })
             continue
           }
           database.storeFeedEntry(subscription.id, entry)
@@ -471,6 +552,11 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url)
       if (request.method === "GET" && url.pathname === "/healthz") return json({ ok: true })
+      if (url.pathname === "/api/webhook") {
+        const response = await updateWebhook(request)
+        apiRequestsTotal.inc({ route: "webhook", method: request.method, status: String(response.status) })
+        return response
+      }
       if (url.pathname === "/api/subscriptions") {
         const response = await subscriptions(request)
         apiRequestsTotal.inc({ route: "subscriptions", method: request.method, status: String(response.status) })

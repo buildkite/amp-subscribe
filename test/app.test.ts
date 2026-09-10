@@ -60,6 +60,139 @@ describe("subscription bridge", () => {
     expect(response.status).toBe(401)
   })
 
+  test("retirement rejects legacy writes on every binding route without changing subscriptions", async () => {
+    const app = createSubscriptionBridge({ ...config, allowLegacyWebhooks: false, fetchFeed: async () => ({
+      feed: { title: "Status", entries: [] }, etag: null, lastModified: null,
+    }) })
+    openBridges.push(app)
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    const input = {
+      repository: "lox/project", pullRequestNumber: 17, events: ["reviews"], behavior: "notify",
+      feedUrl: "https://status.example/feed", webhookUrl: "https://hooks.example.test/thread-secret",
+    }
+    for (const [path, method, success] of [
+      ["/api/subscriptions", "POST", 201], ["/api/feed-subscriptions", "POST", 201], ["/api/webhook", "PUT", 204],
+    ] as const) {
+      const send = (webhookBinding: unknown, webhookUrl = input.webhookUrl) => app.fetch(new Request(`https://bridge.test${path}`, {
+        method, headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ ...input, webhookUrl, webhookBinding }),
+      }))
+      expect((await send("thread_v1")).status).toBe(success)
+      const before = [app.database.list("T-test"), app.database.listFeeds("T-test")]
+      for (const binding of [undefined, "legacy"]) expect((await send(binding, "https://hooks.example.test/shared")).status).toBe(409)
+      for (const binding of [null, "future", 1]) expect((await send(binding)).status).toBe(400)
+      expect([app.database.list("T-test"), app.database.listFeeds("T-test")]).toEqual(before)
+    }
+    expect(warn.mock.calls).toHaveLength(6)
+    expect(warn.mock.calls.map(([line]) => JSON.parse(String(line))))
+      .toEqual(Array.from({ length: 6 }, () => expect.objectContaining({ event: "legacy_webhook_rejected", threadId: "T-test" })))
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("https://")
+  })
+
+  test("webhook migration authenticates and validates the replacement endpoint", async () => {
+    const app = bridge()
+    expect((await app.fetch(new Request("https://bridge.test/api/webhook", { method: "PUT" }))).status).toBe(401)
+    expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
+      headers: { authorization: "Bearer oidc-token" },
+    }))).status).toBe(405)
+    for (const webhookUrl of [null, "http://hooks.example.test/secret", "https://other.test/secret"]) {
+      const response = await app.fetch(new Request("https://bridge.test/api/webhook", {
+        method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl }),
+      }))
+      expect(response.status).toBe(400)
+    }
+  })
+
+  test("migrates only the authenticated thread's subscriptions without losing history or feed baselines", async () => {
+    const app = bridge()
+    const info = spyOn(console, "info").mockImplementation(() => {})
+    const baseline = { id: "entry-1", fingerprint: "version-1", title: null, url: null, publishedAt: null, updatedAt: null }
+    for (const threadId of ["T-test", "T-other"]) {
+      const subscription = app.database.upsert({
+        threadId, repository: "lox/project", targetType: "pull_request", pullRequestNumber: 17,
+        webhookUrl: "https://hooks.example.test/shared", events: ["reviews"], behavior: "implement",
+      })
+      app.database.markDelivered(subscription.id, "delivery-before-migration", "reviews")
+      app.database.upsertFeed({
+        threadId, feedUrl: "https://status.example/feed", webhookUrl: subscription.webhookUrl,
+        behavior: "notify", etag: "etag-before", lastModified: "last-modified-before",
+      }, [baseline])
+    }
+    const github = app.database.list("T-test")[0]!
+    const feed = app.database.listFeeds("T-test")[0]!
+    const otherGitHub = app.database.list("T-other")
+    const otherFeeds = app.database.listFeeds("T-other")
+    const webhookUrl = "https://hooks.example.test/thread-specific-secret"
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await app.fetch(new Request("https://bridge.test/api/webhook", {
+        method: "PUT", headers: { authorization: "Bearer oidc-token" },
+        body: JSON.stringify({ webhookUrl, webhookBinding: "thread_v1", threadId: "T-other" }),
+      }))
+      expect(response.status).toBe(204)
+      expect(await response.text()).toBe("")
+    }
+    expect(app.database.list("T-test")).toEqual([{ ...github, webhookUrl, webhookBinding: "thread_v1" }])
+    expect(app.database.listFeeds("T-test")).toEqual([{ ...feed, webhookUrl, webhookBinding: "thread_v1" }])
+    expect(app.database.wasDelivered(github.id, "delivery-before-migration", "reviews")).toBe(true)
+    expect(app.database.feedEntryChanged(feed.id, baseline)).toBe(false)
+    expect(app.database.list("T-other")).toEqual(otherGitHub)
+    expect(app.database.listFeeds("T-other")).toEqual(otherFeeds)
+    const logs = info.mock.calls.map(([line]) => JSON.parse(String(line)))
+    expect(logs.map((line) => line.changed)).toEqual([{ github: 1, feed: 1 }, { github: 0, feed: 0 }])
+    expect(logs[0]).toMatchObject({ event: "webhook_binding_updated", threadId: "T-test", webhookBinding: "thread_v1" })
+    expect(JSON.stringify(logs)).not.toContain(webhookUrl)
+    const listed = await app.fetch(apiRequest(undefined, "GET"))
+    expect(await listed.json()).toMatchObject({ subscriptions: [{ webhookBinding: "thread_v1" }] })
+  })
+
+  test.each([404, 410])("a late %i from the old webhook cannot delete migrated GitHub or feed subscriptions", async (status) => {
+    const entry = { id: "entry-1", fingerprint: "version-1", title: null, url: null, publishedAt: null, updatedAt: null }
+    const app = createSubscriptionBridge({ ...config, fetchFeed: async () => ({
+      feed: { title: "Status", entries: [entry] }, etag: "new-etag", lastModified: null,
+    }) })
+    openBridges.push(app)
+    const subscription = app.database.upsert({
+      threadId: "T-test", repository: "lox/project", targetType: "pull_request", pullRequestNumber: 17,
+      webhookUrl: "https://hooks.example.test/shared", events: ["reviews"], behavior: "implement",
+    })
+    const feed = app.database.upsertFeed({
+      threadId: "T-test", feedUrl: "https://status.example/feed", webhookUrl: subscription.webhookUrl,
+      behavior: "notify", etag: null, lastModified: null,
+    }, [])
+    const body = JSON.stringify({
+      action: "submitted", repository: { id: 42, full_name: "lox/project" },
+      pull_request: { number: 17 }, review: { id: 91, state: "approved" },
+    })
+    const send = async () => app.fetch(new Request("https://bridge.test/github/webhook", {
+      method: "POST", body, headers: {
+        "x-hub-signature-256": await hmacSha256("github-secret", body),
+        "x-github-event": "pull_request_review", "x-github-delivery": "migration-race",
+      },
+    }))
+    const response = Promise.withResolvers<Response>()
+    const started = Promise.withResolvers<void>()
+    let calls = 0
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (_input, _init) => {
+      if (++calls === 2) started.resolve()
+      return response.promise
+    }) as typeof fetch)
+    const githubRequest = send()
+    const feedPoll = app.pollFeeds()
+    await started.promise
+    const replacement = "https://hooks.example.test/replacement"
+    expect((await app.fetch(new Request("https://bridge.test/api/webhook", {
+      method: "PUT", headers: { authorization: "Bearer oidc-token" }, body: JSON.stringify({ webhookUrl: replacement }),
+    }))).status).toBe(204)
+    response.resolve(new Response(null, { status }))
+    expect(await (await githubRequest).json()).toMatchObject({ failed: 1, removed: 0 })
+    expect(await feedPoll).toMatchObject({ failed: 1, removed: 0 })
+    expect(app.database.list("T-test")).toEqual([{ ...subscription, webhookUrl: replacement }])
+    expect(app.database.listFeeds("T-test")).toEqual([{ ...feed, webhookUrl: replacement }])
+    fetchSpy.mockResolvedValue(new Response(null, { status: 202 }))
+    expect(await (await send()).json()).toMatchObject({ delivered: 1 }) // Explicit GitHub redelivery.
+    expect(await app.pollFeeds()).toMatchObject({ delivered: 1 })
+    expect(fetchSpy.mock.calls.slice(2).map(([url]) => url)).toEqual([replacement, replacement])
+  })
+
   test("registers without exposing the capability URL", async () => {
     const app = bridge()
     const response = await app.fetch(apiRequest({
@@ -78,6 +211,7 @@ describe("subscription bridge", () => {
 
   test("routes and deduplicates shared-webhook GitHub subscriptions by authenticated thread", async () => {
     const app = bridge()
+    const info = spyOn(console, "info").mockImplementation(() => {})
     for (const threadID of ["T-thread-one", "T-thread-two"]) {
       await app.fetch(apiRequest({
         targetThreadID: "T-attacker-controlled",
@@ -142,6 +276,21 @@ describe("subscription bridge", () => {
       expect(delivery.body).not.toContain("UNTRUSTED_SENTINEL")
       expect(delivery.body).not.toContain("T-attacker-controlled")
     }
+    for (const threadID of ["T-thread-one", "T-thread-two"]) {
+      const subscription = app.database.list(threadID)[0]!
+      expect((await app.fetch(apiRequest({ id: subscription.id }, "DELETE", threadID))).status).toBe(204)
+    }
+    expect((await request()).status).toBe(202)
+    const logs = info.mock.calls.map(([line]) => JSON.parse(String(line)))
+    expect(logs.filter((line) => line.event === "github_webhook_processed")).toEqual([
+      expect.objectContaining({ deliveryId: "delivery-1", matchedSubscriptions: 2, delivered: 2, deduplicated: 0 }),
+      expect.objectContaining({ deliveryId: "delivery-1", matchedSubscriptions: 2, delivered: 0, deduplicated: 2 }),
+      expect.objectContaining({ deliveryId: "delivery-1", matchedSubscriptions: 0, delivered: 0, deduplicated: 0 }),
+    ])
+    expect(logs.filter((line) => line.event === "subscription_unsubscribed").map((line) => line.threadId))
+      .toEqual(["T-thread-one", "T-thread-two"])
+    expect(JSON.stringify(logs)).not.toContain("secret-capability")
+    expect(JSON.stringify(logs)).not.toContain("UNTRUSTED_SENTINEL")
   })
 
   test("registers and routes a branch subscription", async () => {
@@ -311,7 +460,7 @@ describe("subscription bridge", () => {
     expect(response.status).toBe(401)
   })
 
-  test.each([404, 410, 503, 202])("logs GitHub removal only for terminal webhook responses (%i)", async (status) => {
+  test.each([404, 410, 503, 202, null])("logs HTTP and transport failures without credentials (%s)", async (status) => {
     const app = bridge()
     const registration = await app.fetch(apiRequest({
       repository: "lox/project",
@@ -322,7 +471,9 @@ describe("subscription bridge", () => {
     }, "POST", "T-removal"))
     const { subscription } = await registration.json() as { subscription: { id: string; createdAt: string } }
     const warn = spyOn(console, "warn").mockImplementation(() => {})
-    spyOn(globalThis, "fetch").mockResolvedValue(new Response("secret-response-body", {
+    const fetchSpy = spyOn(globalThis, "fetch")
+    if (status === null) fetchSpy.mockRejectedValue(new Error("secret-capability"))
+    else fetchSpy.mockResolvedValue(new Response("secret-response-body", {
       status,
       headers: {
         "x-request-id": "amp-request-123",
@@ -346,26 +497,27 @@ describe("subscription bridge", () => {
     }))
     const response = await send()
     const removed = status === 404 || status === 410
-    expect(response.status).toBe(status === 503 ? 502 : 202)
+    expect(response.status).toBe(status === 503 || status === null ? 502 : 202)
     expect(await response.json()).toMatchObject({ removed: removed ? 1 : 0 })
     expect(app.database.list("T-removal")).toHaveLength(removed ? 0 : 1)
-    expect(warn).toHaveBeenCalledTimes(removed ? 1 : 0)
-    if (!removed) return
+    expect(warn).toHaveBeenCalledTimes(status === 202 ? 0 : 1)
+    if (status === 202) return
 
     const line = warn.mock.calls[0]![0] as string
     expect(JSON.parse(line)).toEqual({
       level: "warn",
-      event: "subscription_removed",
+      event: removed ? "subscription_removed" : "webhook_delivery_failed",
       timestamp: expect.any(String),
-      reason: "webhook_not_found_or_gone",
+      reason: removed ? "webhook_not_found_or_gone" : status === null ? "transport_error" : "http_error",
       subscriptionId: subscription.id,
       threadId: "T-removal",
       subscriptionCreatedAt: subscription.createdAt,
+      webhookBinding: "legacy",
       webhookHost: "hooks.example.test",
       webhookUrlHash: "adfa88b122d5500d7af22e6c9cc2b27f0645df7af7df1a1d3c92e04830809e3e",
       httpStatus: status,
-      requestId: "amp-request-123",
-      flyRequestId: "fly-request-456",
+      requestId: status === null ? null : "amp-request-123",
+      flyRequestId: status === null ? null : "fly-request-456",
       source: "github",
       repository: "lox/project",
       targetType: "pull_request",
@@ -374,11 +526,12 @@ describe("subscription bridge", () => {
       githubEvent: "pull_request",
       subscriptionEvent: "commits",
       action: "synchronize",
+      idempotencyKey: `delivery-removal:commits:42:17:${subscription.id}`,
     })
     expect(line).not.toContain("secret-")
     expect(Number.isNaN(Date.parse(JSON.parse(line).timestamp))).toBe(false)
     await send()
-    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledTimes(removed ? 1 : 2)
   })
 
   test.each([404, 410])("logs feed removal without exposing feed or webhook credentials (%i)", async (status) => {

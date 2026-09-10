@@ -12,6 +12,37 @@ afterEach(() => {
 })
 
 describe("SubscriptionDatabase", () => {
+  test("classifies old bindings conservatively and persists migration across restarts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "amp-bindings-"))
+    directories.push(directory)
+    const path = join(directory, "relay.sqlite")
+    let database = new SubscriptionDatabase(path)
+    const github = database.upsert({
+      threadId: "T-test", repository: "lox/project", targetType: "branch", branch: "main",
+      webhookUrl: "https://hooks.example.test/shared", events: ["commits"], behavior: "notify",
+    })
+    const feed = database.upsertFeed({
+      threadId: "T-test", feedUrl: "https://status.example/feed", webhookUrl: github.webhookUrl,
+      behavior: "notify", etag: null, lastModified: null,
+    }, [])
+    database.markDelivered(github.id, "before-migration", "commits")
+    // Reproduce the schema deployed before binding tracking existed.
+    database.sqlite.exec("ALTER TABLE subscriptions DROP COLUMN webhook_binding; ALTER TABLE feed_subscriptions DROP COLUMN webhook_binding")
+    database.close()
+    database = new SubscriptionDatabase(path)
+    expect(database.list("T-test")[0]?.webhookBinding).toBe("legacy")
+    expect(database.listFeeds("T-test")[0]?.webhookBinding).toBe("legacy")
+    const url = "https://hooks.example.test/thread"
+    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 1, feed: 1 })
+    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 0, feed: 0 })
+    database.close()
+    database = new SubscriptionDatabase(path)
+    expect(database.list("T-test")[0]).toEqual({ ...github, webhookUrl: url, webhookBinding: "thread_v1" })
+    expect(database.listFeeds("T-test")[0]).toEqual({ ...feed, webhookUrl: url, webhookBinding: "thread_v1" })
+    expect(database.wasDelivered(github.id, "before-migration", "commits")).toBe(true)
+    database.close()
+  })
+
   test("migrates existing pull request subscriptions and deliveries", () => {
     const directory = mkdtempSync(join(tmpdir(), "amp-subscribe-"))
     directories.push(directory)
@@ -52,6 +83,7 @@ describe("SubscriptionDatabase", () => {
       targetType: "pull_request",
       pullRequestNumber: 17,
       webhookUrl: "https://hooks.example.test/secret",
+      webhookBinding: "legacy",
       events: ["reviews"],
       behavior: "investigate",
       createdAt: "2026-08-23T00:00:00.000Z",

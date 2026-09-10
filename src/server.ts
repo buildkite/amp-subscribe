@@ -13,8 +13,13 @@ if (!Number.isFinite(feedPollSeconds) || feedPollSeconds < 30) {
   throw new Error("FEED_POLL_INTERVAL_SECONDS must be at least 30")
 }
 const values = (name: string) => (process.env[name] ?? "").split(",").map((value) => value.trim()).filter(Boolean)
+const allowLegacyWebhooks = process.env.AMP_ALLOW_LEGACY_WEBHOOKS ?? "true"
+if (allowLegacyWebhooks !== "true" && allowLegacyWebhooks !== "false") {
+  throw new Error("AMP_ALLOW_LEGACY_WEBHOOKS must be true or false")
+}
 const bridge = createSubscriptionBridge({
   databasePath: process.env.DATABASE_PATH ?? "./data/relay.sqlite",
+  allowLegacyWebhooks: allowLegacyWebhooks === "true",
   githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
   allowedWebhookHosts: required("AMP_WEBHOOK_ALLOWED_HOSTS").split(",").map((host) => host.trim().toLowerCase()),
   authenticate: createOidcAuthenticator({

@@ -76,8 +76,7 @@ async function bridgeRequest(amp: PluginAPI, path: string, init: RequestInit = {
     signal: AbortSignal.timeout(10_000),
   })
   if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(`amp-subscribe returned ${response.status}: ${detail}`)
+    throw new Error(`amp-subscribe ${path} returned ${response.status}`)
   }
   return response
 }
@@ -98,6 +97,7 @@ async function subscribe(
         ? { pullRequestNumber: target.number }
         : target.targetType === "branch" ? { branch: target.branch } : {}),
       webhookUrl,
+      webhookBinding: "thread_v1",
       events,
       behavior,
     }),
@@ -114,7 +114,7 @@ async function subscribeToFeed(
 ): Promise<{ id: string }> {
   const response = await bridgeRequest(amp, "/api/feed-subscriptions", {
     method: "POST",
-    body: JSON.stringify({ feedUrl, webhookUrl, behavior }),
+    body: JSON.stringify({ feedUrl, webhookUrl, webhookBinding: "thread_v1", behavior }),
   })
   const result = await response.json() as { subscription: { id: string } }
   return result.subscription
@@ -1174,6 +1174,12 @@ export default async function ampSubscribe(amp: PluginAPI) {
     amp.logger.log("amp-subscribe is disabled outside an Amp-managed orb")
     return
   }
+  // Register at startup so an event can wake a cold orb without a tool/session hook.
+  // Do not use activeThread: UI focus is not the durable registration's owner.
+  const threadID = process.env.AMP_THREAD_ID
+  if (!threadID || !/^T-[A-Za-z0-9-]+$/.test(threadID)) {
+    throw new Error("AMP_THREAD_ID is required for a thread-owned webhook")
+  }
   const pullRequestCreateMarkers = new Map<string, string>()
   const coalescer = new GitHubEventCoalescer()
   const pendingDeliveries = new PendingThreadDeliveryDeduplicator()
@@ -1181,8 +1187,10 @@ export default async function ampSubscribe(amp: PluginAPI) {
   const executions = new Map<string, Promise<void>>()
   const counters = { received: 0, delivered: 0, suppressed: 0, batched: 0 }
   const { url: webhookUrl } = await amp.createWebhook({
-    key: "github-pr-events",
+    key: `github-pr-events:${threadID}`,
     handler: async (event, ctx) => {
+      ctx.logger.log("Webhook event received", { eventId: event.id, ownerThreadID: ctx.thread.id, orbThreadID: threadID })
+      if (ctx.thread.id !== threadID) throw new Error("Webhook registration owner does not match orb thread")
       counters.received += 1
       if (seen.has(event.id)) {
         counters.suppressed += 1
@@ -1197,7 +1205,8 @@ export default async function ampSubscribe(amp: PluginAPI) {
       }
       const execution = (async () => {
         const payload = JSON.parse(new TextDecoder().decode(event.body)) as unknown
-        const targetThread = amp.threads.get(targetThreadID(payload))
+        if (targetThreadID(payload) !== threadID) throw new Error("Webhook target does not match registration owner")
+        const targetThread = ctx.thread
         if (object(payload)?.source === "feed") {
           await targetThread.appendUserMessage(
             { type: "user-message", content: feedPrompt(payload) },
@@ -1256,6 +1265,14 @@ export default async function ampSubscribe(amp: PluginAPI) {
       }
     },
   })
+
+  // Move this thread's existing GitHub and feed subscriptions off the shared URL
+  // without deleting subscriptions, delivery history, or feed baselines.
+  await bridgeRequest(amp, "/api/webhook", {
+    method: "PUT",
+    body: JSON.stringify({ webhookUrl, webhookBinding: "thread_v1" }),
+  })
+  amp.logger.log("Webhook binding registered", { threadID, webhookBinding: "thread_v1" })
 
   amp.on("tool.call", (event) => {
     const shell = amp.helpers.shellCommandFromToolCall(event)

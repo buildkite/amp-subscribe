@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite"
-import type { FeedEntry, FeedSubscription, Subscription, SubscriptionBehavior, SubscriptionEvent } from "./types"
+import type { FeedEntry, FeedSubscription, Subscription, SubscriptionBehavior, SubscriptionEvent, WebhookBinding } from "./types"
 
-type WithoutStoredFields<T> = T extends unknown ? Omit<T, "id" | "createdAt"> : never
+type WithoutStoredFields<T> = T extends unknown ? Omit<T, "id" | "createdAt" | "webhookBinding"> : never
 type SubscriptionInput = WithoutStoredFields<Subscription>
 
 interface SubscriptionRow {
@@ -12,6 +12,7 @@ interface SubscriptionRow {
   target_type: "pull_request" | "branch" | "repository" | null
   target: string | null
   webhook_url: string
+  webhook_binding: WebhookBinding
   events: string
   behavior: SubscriptionBehavior
   created_at: string
@@ -22,6 +23,7 @@ interface FeedSubscriptionRow {
   thread_id: string
   feed_url: string
   webhook_url: string
+  webhook_binding: WebhookBinding
   behavior: SubscriptionBehavior
   etag: string | null
   last_modified: string | null
@@ -34,6 +36,7 @@ function mapFeedSubscription(row: FeedSubscriptionRow): FeedSubscription {
     threadId: row.thread_id,
     feedUrl: row.feed_url,
     webhookUrl: row.webhook_url,
+    webhookBinding: row.webhook_binding,
     behavior: row.behavior,
     etag: row.etag,
     lastModified: row.last_modified,
@@ -47,6 +50,7 @@ function mapSubscription(row: SubscriptionRow): Subscription {
     threadId: row.thread_id,
     repository: row.repository,
     webhookUrl: row.webhook_url,
+    webhookBinding: row.webhook_binding,
     events: JSON.parse(row.events) as SubscriptionEvent[],
     behavior: row.behavior,
     createdAt: row.created_at,
@@ -116,6 +120,14 @@ export class SubscriptionDatabase {
         FOREIGN KEY(subscription_id) REFERENCES feed_subscriptions(id) ON DELETE CASCADE
       );
     `)
+    // Existing endpoints are unclassified until an updated plugin registers them.
+    for (const table of ["subscriptions", "feed_subscriptions"]) {
+      const columns = this.sqlite.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all()
+      if (!columns.some((column) => column.name === "webhook_binding")) {
+        this.sqlite.exec(`ALTER TABLE ${table} ADD COLUMN webhook_binding TEXT NOT NULL
+          DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1'))`)
+      }
+    }
   }
 
   private migratePullRequestSubscriptions(): void {
@@ -197,7 +209,7 @@ export class SubscriptionDatabase {
     this.sqlite.exec("PRAGMA foreign_keys = ON")
   }
 
-  upsert(input: SubscriptionInput): Subscription {
+  upsert(input: SubscriptionInput, webhookBinding: WebhookBinding = "legacy"): Subscription {
     const target = input.targetType === "pull_request" ? String(input.pullRequestNumber)
       : input.targetType === "branch" ? input.branch
         : "*"
@@ -212,11 +224,11 @@ export class SubscriptionDatabase {
       id: existing?.id ?? crypto.randomUUID(),
       createdAt: existing?.created_at ?? new Date().toISOString(),
     }
-    const subscription: Subscription = { ...input, ...stored }
+    const subscription: Subscription = { ...input, ...stored, webhookBinding }
     if (existing) {
       this.sqlite.query(`
         UPDATE subscriptions SET
-          target_type = ?, target = ?, pull_request_number = ?, webhook_url = ?, events = ?, behavior = ?
+          target_type = ?, target = ?, pull_request_number = ?, webhook_url = ?, events = ?, behavior = ?, webhook_binding = ?
         WHERE id = ?
       `).run(
         subscription.targetType,
@@ -225,14 +237,15 @@ export class SubscriptionDatabase {
         subscription.webhookUrl,
         JSON.stringify(subscription.events),
         subscription.behavior,
+        webhookBinding,
         subscription.id,
       )
     } else {
       this.sqlite.query(`
         INSERT INTO subscriptions
           (id, thread_id, repository, pull_request_number, target_type, target,
-            webhook_url, events, behavior, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            webhook_url, events, behavior, created_at, webhook_binding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         subscription.id,
         subscription.threadId,
@@ -244,6 +257,7 @@ export class SubscriptionDatabase {
         JSON.stringify(subscription.events),
         subscription.behavior,
         subscription.createdAt,
+        webhookBinding,
       )
     }
     return subscription
@@ -268,6 +282,27 @@ export class SubscriptionDatabase {
     ).all(threadId).map(mapSubscription)
   }
 
+  updateWebhook(threadId: string, webhookUrl: string, webhookBinding: WebhookBinding = "legacy") {
+    return this.sqlite.transaction(() => {
+      const github = this.sqlite.query(`UPDATE subscriptions SET webhook_url = ?, webhook_binding = ?
+        WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
+        .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
+      const feed = this.sqlite.query(`UPDATE feed_subscriptions SET webhook_url = ?, webhook_binding = ?
+        WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
+        .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
+      return { github, feed }
+    })()
+  }
+
+  countWebhookBindings() {
+    return this.sqlite.query<{ source: string; binding: WebhookBinding; count: number }, []>(`
+      SELECT 'github' AS source, webhook_binding AS binding, COUNT(*) AS count
+      FROM subscriptions GROUP BY webhook_binding
+      UNION ALL
+      SELECT 'feed', webhook_binding, COUNT(*) FROM feed_subscriptions GROUP BY webhook_binding
+    `).all()
+  }
+
   matching(repository: string, targetType: Subscription["targetType"], target: string, event: SubscriptionEvent): Subscription[] {
     return this.sqlite.query<SubscriptionRow, [string, string, string, string, string]>(`
       SELECT * FROM subscriptions WHERE repository = ?
@@ -277,8 +312,10 @@ export class SubscriptionDatabase {
       .filter((subscription) => subscription.events.includes(event))
   }
 
-  delete(threadId: string, id: string): boolean {
-    return this.sqlite.query("DELETE FROM subscriptions WHERE id = ? AND thread_id = ?").run(id, threadId).changes > 0
+  delete(threadId: string, id: string, webhookUrl: string | null = null): boolean {
+    return this.sqlite.query(`
+      DELETE FROM subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
+    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
   }
 
   wasDelivered(subscriptionId: string, deliveryId: string, event: string): boolean {
@@ -294,13 +331,14 @@ export class SubscriptionDatabase {
     `).run(subscriptionId, deliveryId, event, new Date().toISOString())
   }
 
-  upsertFeed(input: Omit<FeedSubscription, "id" | "createdAt">, baseline: FeedEntry[]): FeedSubscription {
+  upsertFeed(input: WithoutStoredFields<FeedSubscription>, baseline: FeedEntry[], webhookBinding: WebhookBinding = "legacy"): FeedSubscription {
     return this.sqlite.transaction(() => {
       const existing = this.sqlite.query<FeedSubscriptionRow, [string, string]>(`
         SELECT * FROM feed_subscriptions WHERE thread_id = ? AND feed_url = ?
       `).get(input.threadId, input.feedUrl)
       const subscription: FeedSubscription = {
         ...input,
+        webhookBinding,
         id: existing?.id ?? crypto.randomUUID(),
         etag: existing?.etag ?? input.etag,
         lastModified: existing?.last_modified ?? input.lastModified,
@@ -309,14 +347,14 @@ export class SubscriptionDatabase {
       if (existing) {
         this.sqlite.query(`
           UPDATE feed_subscriptions
-          SET webhook_url = ?, behavior = ?
+          SET webhook_url = ?, behavior = ?, webhook_binding = ?
           WHERE id = ?
-        `).run(input.webhookUrl, input.behavior, existing.id)
+        `).run(input.webhookUrl, input.behavior, webhookBinding, existing.id)
       } else {
         this.sqlite.query(`
           INSERT INTO feed_subscriptions
-            (id, thread_id, feed_url, webhook_url, behavior, etag, last_modified, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, thread_id, feed_url, webhook_url, behavior, etag, last_modified, created_at, webhook_binding)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           subscription.id,
           subscription.threadId,
@@ -326,6 +364,7 @@ export class SubscriptionDatabase {
           subscription.etag,
           subscription.lastModified,
           subscription.createdAt,
+          webhookBinding,
         )
         for (const entry of baseline) this.storeFeedEntry(subscription.id, entry)
       }
@@ -365,9 +404,10 @@ export class SubscriptionDatabase {
     `).run(subscriptionId, entry.id, entry.fingerprint, new Date().toISOString())
   }
 
-  deleteFeed(threadId: string, id: string): boolean {
-    return this.sqlite.query("DELETE FROM feed_subscriptions WHERE id = ? AND thread_id = ?")
-      .run(id, threadId).changes > 0
+  deleteFeed(threadId: string, id: string, webhookUrl: string | null = null): boolean {
+    return this.sqlite.query(`
+      DELETE FROM feed_subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
+    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
   }
 
   close(): void {

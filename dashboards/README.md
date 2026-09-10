@@ -28,6 +28,31 @@ when needed.
 If a dashboard with the same UID (`dfx41yxf19xq8f`) already exists in that org, importing again updates
 it in place rather than creating a duplicate.
 
+## Webhook migration
+
+After deploying the per-thread webhook bridge, add a Stat panel for **Legacy subscriptions remaining**:
+
+```promql
+sum by (app) (amp_subscribe_webhook_bindings{app=~"$app",binding="legacy"})
+```
+
+For a time series showing both versions and GitHub/feed sources:
+
+```promql
+sum by (app, source, binding) (amp_subscribe_webhook_bindings{app=~"$app"})
+```
+
+Use the existing `$app` variable and `Prometheus on Fly` datasource. These queries are ready to add;
+the exported dashboard JSON and live Grafana dashboard are not changed by this documentation.
+Keep “No data” distinct from zero and verify fresh, healthy scrapes. The gauge is rebuilt from the
+database on every scrape, with explicit zeroes for every source/version pair and no per-thread or
+URL labels.
+
+Zero means no **retained legacy subscription rows**, not that all old threads migrated or Amp's
+old webhook queues drained. Deletions also lower it. Follow the README's
+[retirement procedure](../README.md#tracking-completion-and-retiring-legacy-clients), including
+reconciling removal logs and dormant threads, before disabling legacy clients.
+
 ## Keeping this file in sync
 
 There's no automated push from Grafana back to this repo. After editing the dashboard in the Grafana UI,
