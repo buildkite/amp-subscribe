@@ -290,13 +290,14 @@ a file is not evidence the handler did not run. Preserve bridge logs externally 
 beyond the hosting provider's retention window; deletion still cascades the SQLite delivery ledger.
 
 The included `fly.toml` targets Buildkite's `bk-amp-subscribe` Fly.io app. Successful CI runs on
-pushes to `main` trigger deployment through `.github/workflows/deploy.yml`. The repository's
-`FLY_API_TOKEN` Actions secret must contain a deploy token for this app, not the previous
-`lox-amp-subscribe` app:
+pushes to `main` trigger deployment through `.github/workflows/deploy.yml`. Configure the GitHub
+`production` environment to allow only the exact `main` branch (not tags), with no required
+reviewers. Store `FLY_API_TOKEN` in that environment, not as a repository secret. It must contain
+a deploy token for this app, not the previous `lox-amp-subscribe` app:
 
 ```sh
 mise exec -- flyctl tokens create deploy --app bk-amp-subscribe --expiry 8760h | \
-  gh secret set FLY_API_TOKEN --repo buildkite/amp-subscribe
+  gh secret set FLY_API_TOKEN --env production --repo buildkite/amp-subscribe
 ```
 
 Before the first deployment, create the app in Buildkite's Fly organization if needed and set its
