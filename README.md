@@ -289,8 +289,25 @@ These plugin logs may be trace span events rather than durable local log files; 
 a file is not evidence the handler did not run. Preserve bridge logs externally if you need history
 beyond the hosting provider's retention window; deletion still cascades the SQLite delivery ledger.
 
-The included `fly.toml` shows one Fly.io deployment. Before deploying a copy, change its app name,
-region, and OIDC audience, then create the app and set its secrets:
+The included `fly.toml` targets Buildkite's `bk-amp-subscribe` Fly.io app. Successful CI runs on
+pushes to `main` trigger deployment through `.github/workflows/deploy.yml`. The repository's
+`FLY_API_TOKEN` Actions secret must contain a deploy token for this app, not the previous
+`lox-amp-subscribe` app:
+
+```sh
+mise exec -- flyctl tokens create deploy --app bk-amp-subscribe --expiry 8760h | \
+  gh secret set FLY_API_TOKEN --repo buildkite/amp-subscribe
+```
+
+Before the first deployment, create the app in Buildkite's Fly organization if needed and set its
+`GITHUB_WEBHOOK_SECRET` and Amp allowlist secrets. Point the GitHub App webhook to
+`https://bk-amp-subscribe.fly.dev/github/webhook` and clients' `AMP_SUBSCRIBE_URL` to
+`https://bk-amp-subscribe.fly.dev` when cutting over. The existing OIDC audiences are retained for
+client compatibility. The old app's SQLite subscriptions do not move automatically; migrate the
+database or recreate subscriptions on the new app.
+
+For a separate self-hosted deployment, change the app name, region, and OIDC audience, then create
+the app and set its secrets:
 
 ```sh
 APP=your-amp-subscribe-app
