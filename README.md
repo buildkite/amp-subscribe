@@ -52,8 +52,8 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
    Investigate reviews and CI failures.
    ```
 
-   Add “always queue these events” or “always steer these events” when creating a GitHub
-   subscription to override automatic delivery for that subscription.
+   Incoming events steer active work by default. Add “always queue these events” when creating
+   a GitHub subscription to opt out of steering for that subscription.
 
    Or watch a branch:
 
@@ -194,13 +194,15 @@ used when feeds provide ETag or Last-Modified headers.
 
 The bridge drops queued and in-progress check lifecycle events before they consume durable webhook
 capacity. GitHub subscriptions accept a delivery mode: `queue` never steers, `steer` always steers,
-and `automatic` only steers terminal failures while queuing routine events. Existing subscriptions
-default to `automatic`. For pull requests, a successful check
+and `automatic` (the default) also steers all delivered events. This applies to existing `automatic`
+subscriptions and payloads without a delivery mode; explicit `queue` subscriptions stay queued.
+Feed events also steer. This does not clear messages already queued in a thread.
+For pull requests, a successful check
 triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
 GitHub's current status rollup has passed. Branch check successes retain short-window batching. The
-plugin also batches review submissions with their line comments, queues agent-authored comment
-replies without steering active work, and suppresses pull request body/title edits. Plugin
+plugin also batches review submissions with their line comments, delivers agent-authored comment
+replies using the subscription's delivery mode, and suppresses pull request body/title edits. Plugin
 logs include delivery reasons, steering decisions, and cumulative received/delivered/suppressed/
 batched counts.
 

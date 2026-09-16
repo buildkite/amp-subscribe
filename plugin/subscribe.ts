@@ -660,7 +660,7 @@ export interface CoalescingResult {
 export class PendingThreadDeliveryDeduplicator {
   private readonly executions = new Map<string, Promise<void>>()
 
-  async append(target: PluginThread, delivery: CoalescedDelivery, steer = delivery.urgent): Promise<boolean> {
+  async append(target: PluginThread, delivery: CoalescedDelivery, steer = true): Promise<boolean> {
     const previous = this.executions.get(target.id) ?? Promise.resolve()
     const execution = previous.catch(() => undefined).then(async () => {
       const messages = await target.messages({ from: "end", limit: 20, roles: ["user", "assistant"] })
@@ -1239,8 +1239,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
             ? await readPullRequestCIState(amp, payload)
             : undefined
           const result = await coalescer.handle(payload, async (delivery) => {
-            const steer = deliveryMode === "steer"
-              || (deliveryMode === "automatic" && delivery.urgent)
+            const steer = deliveryMode !== "queue"
             if (!await pendingDeliveries.append(targetThread, delivery, steer)) {
               counters.suppressed += 1
               ctx.logger.log("GitHub event suppressed", {
@@ -1382,7 +1381,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a URL or GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: pullRequestEvents }, description: "Events to subscribe to; defaults to all supported events" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
-        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic (default) and steer use steering; queue opts out" },
       },
       required: ["pullRequest"],
     },
@@ -1412,7 +1411,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: repositoryEvents }, description: "Events to subscribe to; defaults to pull requests and issues" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
-        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic (default) and steer use steering; queue opts out" },
       },
     },
     async execute(input, ctx) {
@@ -1449,7 +1448,7 @@ export default async function ampSubscribe(amp: PluginAPI) {
         repository: { type: "string", description: "owner/repo; optional when a GitHub origin remote is available" },
         events: { type: "array", items: { type: "string", enum: defaultBranchEvents }, description: "Events to subscribe to; defaults to commits and checks" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
-        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic, always queue, or always steer; defaults to automatic" },
+        deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic (default) and steer use steering; queue opts out" },
       },
       required: ["branch"],
     },
