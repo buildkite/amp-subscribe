@@ -574,10 +574,10 @@ describe("webhook handler delivery", () => {
     ])
     expect(completed).toBe(true)
     expect(stateReads).toBe(0)
-    expect(steer).toBe(false)
+    expect(steer).toBe(true)
   })
 
-  test("applies explicit delivery modes instead of automatic urgency", async () => {
+  test("honors explicit queue and steer delivery modes", async () => {
     const steering: Array<boolean | undefined> = []
     const append = async (_threadID: string, _message: unknown, options: { steer?: boolean }) => {
       steering.push(options.steer)
@@ -607,20 +607,25 @@ describe("webhook handler delivery", () => {
     expect(steering).toEqual([false, true])
   })
 
-  test("uses event urgency for automatic delivery", async () => {
+  test("steers routine events and failures for existing automatic subscriptions", async () => {
     const steering: boolean[] = []
     const handler = await captureWebhookHandler(
       async (_threadID, _message, options) => { steering.push(options.steer ?? false) },
     )
     const routine = webhookInvocation("automatic-routine-event")
+    routine.event.body = new TextEncoder().encode(JSON.stringify({
+      ...JSON.parse(new TextDecoder().decode(routine.event.body)),
+      deliveryMode: "automatic",
+    }))
     await handler(routine.event, routine.context)
     const failure = webhookInvocation("automatic-failure-event")
     failure.event.body = new TextEncoder().encode(JSON.stringify({
       ...checkEvent("check_run", 401, "completed", "failure"),
       targetThreadID: "T-target-thread",
+      deliveryMode: "automatic",
     }))
     await handler(failure.event, failure.context)
-    expect(steering).toEqual([false, true])
+    expect(steering).toEqual([true, true])
   })
 
   test("delivers each thread's feed events without passing them through GitHub coalescing", async () => {
