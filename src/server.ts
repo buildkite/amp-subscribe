@@ -21,6 +21,9 @@ const bridge = createSubscriptionBridge({
   databasePath: process.env.DATABASE_PATH ?? "./data/relay.sqlite",
   allowLegacyWebhooks: allowLegacyWebhooks === "true",
   githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
+  buildkiteWebhookSecret: required("BUILDKITE_WEBHOOK_SECRET"),
+  buildkiteAllowedOrganizations: required("BUILDKITE_ALLOWED_ORGANIZATIONS")
+    .split(",").map((organization) => organization.trim().toLowerCase()).filter(Boolean),
   allowedWebhookHosts: required("AMP_WEBHOOK_ALLOWED_HOSTS").split(",").map((host) => host.trim().toLowerCase()),
   authenticate: createOidcAuthenticator({
     audience: required("AMP_OIDC_AUDIENCE").split(",").map((audience) => audience.trim()).filter(Boolean),

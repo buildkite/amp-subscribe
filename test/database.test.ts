@@ -25,6 +25,10 @@ describe("SubscriptionDatabase", () => {
       threadId: "T-test", feedUrl: "https://status.example/feed", webhookUrl: github.webhookUrl,
       behavior: "notify", etag: null, lastModified: null,
     }, [])
+    const buildkite = database.upsertBuildkite({
+      threadId: "T-test", organization: "buildkite", pipeline: "amp-subscribe",
+      webhookUrl: github.webhookUrl, events: ["build.finished"], behavior: "investigate",
+    })
     database.markDelivered(github.id, "before-migration", "commits")
     // Reproduce the schema deployed before binding tracking existed.
     database.sqlite.exec("ALTER TABLE subscriptions DROP COLUMN webhook_binding; ALTER TABLE feed_subscriptions DROP COLUMN webhook_binding")
@@ -33,12 +37,13 @@ describe("SubscriptionDatabase", () => {
     expect(database.list("T-test")[0]?.webhookBinding).toBe("legacy")
     expect(database.listFeeds("T-test")[0]?.webhookBinding).toBe("legacy")
     const url = "https://hooks.example.test/thread"
-    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 1, feed: 1 })
-    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 0, feed: 0 })
+    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 1, feed: 1, buildkite: 1 })
+    expect(database.updateWebhook("T-test", url, "thread_v1")).toEqual({ github: 0, feed: 0, buildkite: 0 })
     database.close()
     database = new SubscriptionDatabase(path)
     expect(database.list("T-test")[0]).toEqual({ ...github, webhookUrl: url, webhookBinding: "thread_v1" })
     expect(database.listFeeds("T-test")[0]).toEqual({ ...feed, webhookUrl: url, webhookBinding: "thread_v1" })
+    expect(database.listBuildkite("T-test")[0]).toEqual({ ...buildkite, webhookUrl: url, webhookBinding: "thread_v1" })
     expect(database.wasDelivered(github.id, "before-migration", "commits")).toBe(true)
     database.close()
   })
@@ -241,6 +246,41 @@ describe("SubscriptionDatabase", () => {
     expect(updated.id).toBe(subscription.id)
     expect(updated.deliveryMode).toBe("queue")
     expect(database.list("T-test")).toEqual([updated])
+    database.close()
+  })
+
+  test("stores, updates, matches, and deduplicates Buildkite subscriptions", () => {
+    const database = new SubscriptionDatabase(":memory:")
+    const subscription = database.upsertBuildkite({
+      threadId: "T-test",
+      organization: "Buildkite",
+      pipeline: "Amp-Subscribe",
+      webhookUrl: "https://hooks.example.test/buildkite",
+      events: ["build.finished", "build.skipped"],
+      behavior: "investigate",
+    }, "thread_v1")
+    expect(subscription).toMatchObject({
+      organization: "buildkite", pipeline: "amp-subscribe", deliveryMode: "automatic", webhookBinding: "thread_v1",
+    })
+    expect(database.matchingBuildkite("BUILDKITE", "AMP-SUBSCRIBE", "build.finished")).toEqual([subscription])
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.running")).toEqual([])
+    database.markBuildkiteDelivered(subscription.id, "delivery-1", "build.finished")
+    expect(database.wasBuildkiteDelivered(subscription.id, "delivery-1", "build.finished")).toBe(true)
+
+    const updated = database.upsertBuildkite({
+      threadId: "T-test",
+      organization: "buildkite",
+      pipeline: "amp-subscribe",
+      webhookUrl: "https://hooks.example.test/updated",
+      events: ["build.finished"],
+      behavior: "notify",
+      deliveryMode: "queue",
+    }, "thread_v1")
+    expect(updated.id).toBe(subscription.id)
+    expect(database.listBuildkite("T-test")).toEqual([updated])
+    expect(database.countBuildkiteSubscriptions()).toBe(1)
+    expect(database.deleteBuildkite("T-other", updated.id)).toBe(false)
+    expect(database.deleteBuildkite("T-test", updated.id)).toBe(true)
     database.close()
   })
 })
