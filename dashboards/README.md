@@ -36,7 +36,7 @@ After deploying the per-thread webhook bridge, add a Stat panel for **Legacy sub
 sum by (app) (amp_subscribe_webhook_bindings{app=~"$app",binding="legacy"})
 ```
 
-For a time series showing both versions and GitHub/feed sources:
+For a time series showing both versions and GitHub/Buildkite/feed sources:
 
 ```promql
 sum by (app, source, binding) (amp_subscribe_webhook_bindings{app=~"$app"})

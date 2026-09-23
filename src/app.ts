@@ -2,13 +2,17 @@ import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { OrbIdentity } from "./auth"
+import { normalizeBuildkiteEvent, verifyBuildkiteSignature } from "./buildkite"
 import { verifyHmac } from "./crypto"
 import { SubscriptionDatabase } from "./database"
 import { normalizeGitHubEvent } from "./events"
 import { fetchFeed, type FetchedFeed } from "./feeds"
 import { MetricsRegistry } from "./metrics"
 import {
+  buildkiteEvents,
   subscriptionEvents,
+  type BuildkiteEvent,
+  type BuildkiteSubscription,
   type RoutedEvent,
   type Subscription,
   type SubscriptionBehavior,
@@ -20,6 +24,8 @@ import {
 export interface SubscriptionBridgeConfig {
   databasePath: string
   githubWebhookSecret: string
+  buildkiteWebhookSecret: string
+  buildkiteAllowedOrganizations: string[]
   allowedWebhookHosts: string[]
   authenticate: (request: Request) => Promise<OrbIdentity>
   allowLegacyWebhooks?: boolean
@@ -50,7 +56,7 @@ function json(value: unknown, status = 200): Response {
 }
 
 function logWebhookOutcome(
-  subscription: Pick<Subscription, "id" | "threadId" | "createdAt" | "webhookUrl" | "webhookBinding">,
+  subscription: Pick<Subscription | BuildkiteSubscription, "id" | "threadId" | "createdAt" | "webhookUrl" | "webhookBinding">,
   response: Response | null,
   details: Record<string, unknown>,
 ): void {
@@ -87,6 +93,16 @@ function validEvents(value: unknown): value is SubscriptionEvent[] {
   return Array.isArray(value) && value.length > 0 && value.every((event) =>
     typeof event === "string" && subscriptionEvents.includes(event as SubscriptionEvent),
   )
+}
+
+function validBuildkiteEvents(value: unknown): value is BuildkiteEvent[] {
+  return Array.isArray(value) && value.length > 0 && value.every((event) =>
+    typeof event === "string" && buildkiteEvents.includes(event as BuildkiteEvent),
+  )
+}
+
+function validBuildkiteSlug(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(value)
 }
 
 function validBehavior(value: unknown): value is SubscriptionBehavior {
@@ -131,6 +147,10 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     "amp_subscribe_feed_subscriptions",
     "Current number of feed subscriptions.",
   )
+  const buildkiteSubscriptionsGauge = metrics.gauge(
+    "amp_subscribe_buildkite_subscriptions",
+    "Current number of Buildkite pipeline subscriptions.",
+  )
   const apiRequestsTotal = metrics.counter(
     "amp_subscribe_api_requests_total",
     "Subscription API requests, by route, method and response status.",
@@ -159,9 +179,23 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     "amp_subscribe_feed_poll_total",
     "Feed polling outcomes, by result.",
   )
+  const buildkiteWebhookEventsReceivedTotal = metrics.counter(
+    "amp_subscribe_buildkite_webhook_events_received_total",
+    "Buildkite webhook deliveries received with a valid signature, by event type.",
+  )
+  const buildkiteWebhookSignatureFailuresTotal = metrics.counter(
+    "amp_subscribe_buildkite_webhook_signature_failures_total",
+    "Buildkite webhook deliveries rejected for an invalid or stale HMAC signature.",
+  )
+  const buildkiteWebhookDeliveriesTotal = metrics.counter(
+    "amp_subscribe_buildkite_webhook_deliveries_total",
+    "Attempts to forward a matched Buildkite event to an Amp durable webhook, by outcome.",
+  )
   for (const outcome of ["delivered", "failed", "removed"]) webhookDeliveriesTotal.inc({ outcome }, 0)
+  for (const outcome of ["delivered", "failed", "removed"]) buildkiteWebhookDeliveriesTotal.inc({ outcome }, 0)
   for (const result of ["checked", "delivered", "failed", "removed"]) feedPollTotal.inc({ result }, 0)
   webhookSignatureFailuresTotal.inc({}, 0)
+  buildkiteWebhookSignatureFailuresTotal.inc({}, 0)
 
   function refreshGauges(): void {
     const counts = new Map(database.countSubscriptionsByTargetType().map((row) => [row.targetType, row.count]))
@@ -169,8 +203,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       subscriptionsGauge.set({ target_type: targetType }, counts.get(targetType) ?? 0)
     }
     feedSubscriptionsGauge.set({}, database.countFeedSubscriptions())
+    buildkiteSubscriptionsGauge.set({}, database.countBuildkiteSubscriptions())
     const bindings = database.countWebhookBindings()
-    for (const source of ["github", "feed"]) {
+    for (const source of ["github", "feed", "buildkite"]) {
       for (const binding of ["legacy", "thread_v1"]) {
         webhookBindingsGauge.set({ source, binding },
           bindings.find((row) => row.source === source && row.binding === binding)?.count ?? 0)
@@ -277,6 +312,148 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       changed, webhookUrlHash: createHash("sha256").update(input.webhookUrl).digest("hex"),
       timestamp: new Date().toISOString() }))
     return new Response(null, { status: 204 })
+  }
+
+  async function buildkiteSubscriptions(request: Request): Promise<Response> {
+    const identity = await config.authenticate(request).catch(() => null)
+    if (!identity) return json({ error: "unauthorized" }, 401)
+
+    if (request.method === "GET") {
+      return json({ subscriptions: database.listBuildkite(identity.threadId).map(({ webhookUrl: _, ...item }) => item) })
+    }
+
+    if (request.method === "POST") {
+      const input = await request.json().catch(() => null) as Record<string, unknown> | null
+      const organization = typeof input?.organization === "string" ? input.organization.toLowerCase() : ""
+      const pipeline = typeof input?.pipeline === "string" ? input.pipeline.toLowerCase() : ""
+      const webhookUrl = input?.webhookUrl
+      const events = input?.events
+      const behavior = input?.behavior
+      const deliveryMode = input?.deliveryMode
+      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
+      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
+      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
+      if (!validBuildkiteSlug(organization)
+        || !config.buildkiteAllowedOrganizations.map((item) => item.toLowerCase()).includes(organization)) {
+        return json({ error: "organization is not allowed" }, 400)
+      }
+      if (!validBuildkiteSlug(pipeline)) return json({ error: "invalid pipeline" }, 400)
+      if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
+        return json({ error: "webhookUrl host is not allowed" }, 400)
+      }
+      if (!validBuildkiteEvents(events)) return json({ error: "invalid events" }, 400)
+      if (!validBehavior(behavior)) return json({ error: "invalid behavior" }, 400)
+      if (deliveryMode !== undefined && !validDeliveryMode(deliveryMode)) {
+        return json({ error: "invalid deliveryMode" }, 400)
+      }
+      const subscription = database.upsertBuildkite({
+        threadId: identity.threadId,
+        organization,
+        pipeline,
+        webhookUrl,
+        events,
+        behavior,
+        deliveryMode,
+      }, webhookBinding)
+      console.info(JSON.stringify({ event: "subscription_registered", source: "buildkite",
+        threadId: identity.threadId, subscriptionId: subscription.id, webhookBinding,
+        timestamp: new Date().toISOString() }))
+      const { webhookUrl: _, ...safeSubscription } = subscription
+      return json({ subscription: safeSubscription }, 201)
+    }
+
+    if (request.method === "DELETE") {
+      const input = await request.json().catch(() => null) as Record<string, unknown> | null
+      if (typeof input?.id !== "string") return json({ error: "id is required" }, 400)
+      const deleted = database.deleteBuildkite(identity.threadId, input.id)
+      if (deleted) console.info(JSON.stringify({ event: "subscription_unsubscribed", source: "buildkite",
+        threadId: identity.threadId, subscriptionId: input.id, timestamp: new Date().toISOString() }))
+      return deleted ? new Response(null, { status: 204 }) : json({ error: "subscription not found" }, 404)
+    }
+
+    return json({ error: "method not allowed" }, 405)
+  }
+
+  async function buildkiteWebhook(request: Request): Promise<Response> {
+    const body = new Uint8Array(await request.arrayBuffer())
+    const signature = request.headers.get("x-buildkite-signature") ?? ""
+    if (!await verifyBuildkiteSignature(config.buildkiteWebhookSecret, body, signature)) {
+      buildkiteWebhookSignatureFailuresTotal.inc()
+      return json({ error: "invalid signature" }, 401)
+    }
+    const eventName = request.headers.get("x-buildkite-event") ?? ""
+    const metricEvent = buildkiteEvents.includes(eventName as BuildkiteEvent) ? eventName : "unknown"
+    buildkiteWebhookEventsReceivedTotal.inc({ event: metricEvent })
+    const deliveryId = createHash("sha256").update(eventName).update("\0").update(body).digest("hex")
+    let payload: unknown
+    try {
+      payload = JSON.parse(new TextDecoder().decode(body)) as unknown
+    } catch {
+      return json({ error: "invalid JSON" }, 400)
+    }
+    const event = normalizeBuildkiteEvent(eventName, deliveryId, payload)
+    if (!event) return json({ accepted: true, matchedEvents: 0, delivered: 0, removed: 0 }, 202)
+    if (!config.buildkiteAllowedOrganizations.map((item) => item.toLowerCase()).includes(event.organization)) {
+      return json({ error: "organization is not allowed" }, 403)
+    }
+
+    let delivered = 0
+    let failed = 0
+    let removed = 0
+    let deduplicated = 0
+    const subscriptions = database.matchingBuildkite(event.organization, event.pipeline.slug, event.event)
+    for (const subscription of subscriptions) {
+      if (database.wasBuildkiteDelivered(subscription.id, deliveryId, event.event)) {
+        deduplicated += 1
+        continue
+      }
+      const idempotencyKey = `buildkite:${deliveryId}:${subscription.id}`
+      const details = { source: "buildkite", organization: event.organization, pipeline: event.pipeline.slug,
+        deliveryId, buildkiteEvent: event.event, buildId: event.build.id, idempotencyKey }
+      let response: Response
+      try {
+        response = await fetch(subscription.webhookUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+          body: JSON.stringify({ ...event, behavior: subscription.behavior,
+            deliveryMode: subscription.deliveryMode, targetThreadID: subscription.threadId }),
+          signal: AbortSignal.timeout(10_000),
+        })
+      } catch {
+        failed += 1
+        buildkiteWebhookDeliveriesTotal.inc({ outcome: "failed" })
+        logWebhookOutcome(subscription, null, { ...details, event: "webhook_delivery_failed", reason: "transport_error" })
+        continue
+      }
+      if (response.status === 404 || response.status === 410) {
+        if (!database.deleteBuildkite(subscription.threadId, subscription.id, subscription.webhookUrl)) {
+          failed += 1
+          buildkiteWebhookDeliveriesTotal.inc({ outcome: "failed" })
+          logWebhookOutcome(subscription, response, { ...details, event: "webhook_delivery_failed",
+            reason: "subscription_changed_or_deleted" })
+          continue
+        }
+        removed += 1
+        buildkiteWebhookDeliveriesTotal.inc({ outcome: "removed" })
+        logWebhookOutcome(subscription, response, { ...details, event: "subscription_removed",
+          reason: "webhook_not_found_or_gone" })
+        continue
+      }
+      if (!response.ok) {
+        failed += 1
+        buildkiteWebhookDeliveriesTotal.inc({ outcome: "failed" })
+        logWebhookOutcome(subscription, response, { ...details, event: "webhook_delivery_failed", reason: "http_error" })
+        continue
+      }
+      database.markBuildkiteDelivered(subscription.id, deliveryId, event.event)
+      delivered += 1
+      buildkiteWebhookDeliveriesTotal.inc({ outcome: "delivered" })
+    }
+    console.info(JSON.stringify({ event: "buildkite_webhook_processed", deliveryId, buildkiteEvent: event.event,
+      organization: event.organization, pipeline: event.pipeline.slug, matchedSubscriptions: subscriptions.length,
+      deduplicated, delivered, failed, removed, timestamp: new Date().toISOString() }))
+    if (failed > 0) return json({ error: "Amp webhook delivery failed", failed, delivered, removed }, 502)
+    return json({ accepted: true, matchedEvents: 1, delivered, removed }, 202)
   }
 
   async function githubWebhook(request: Request): Promise<Response> {
@@ -582,7 +759,13 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         })
         return response
       }
+      if (url.pathname === "/api/buildkite-subscriptions") {
+        const response = await buildkiteSubscriptions(request)
+        apiRequestsTotal.inc({ route: "buildkite-subscriptions", method: request.method, status: String(response.status) })
+        return response
+      }
       if (request.method === "POST" && url.pathname === "/github/webhook") return githubWebhook(request)
+      if (request.method === "POST" && url.pathname === "/buildkite/webhook") return buildkiteWebhook(request)
       return json({ error: "not found" }, 404)
     },
   }

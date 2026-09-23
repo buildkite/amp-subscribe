@@ -5,6 +5,8 @@ import { hmacSha256 } from "../src/crypto"
 const config = {
   databasePath: ":memory:",
   githubWebhookSecret: "github-secret",
+  buildkiteWebhookSecret: "buildkite-secret",
+  buildkiteAllowedOrganizations: ["buildkite"],
   allowedWebhookHosts: ["example.test"],
   authenticate: async (request: Request) => {
     if (request.headers.get("authorization") !== "Bearer oidc-token") throw new Error("unauthorized")
@@ -41,10 +43,14 @@ describe("metrics", () => {
     expect(text).toContain('amp_subscribe_subscriptions{target_type="branch"} 0')
     expect(text).toContain('amp_subscribe_subscriptions{target_type="repository"} 0')
     expect(text).toContain("amp_subscribe_feed_subscriptions 0")
+    expect(text).toContain("amp_subscribe_buildkite_subscriptions 0")
     expect(text).toContain('amp_subscribe_webhook_bindings{binding="legacy",source="github"} 0')
     expect(text).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="feed"} 0')
+    expect(text).toContain('amp_subscribe_webhook_bindings{binding="thread_v1",source="buildkite"} 0')
     expect(text).toContain('amp_subscribe_webhook_deliveries_total{outcome="delivered"} 0')
     expect(text).toContain("amp_subscribe_webhook_signature_failures_total 0")
+    expect(text).toContain('amp_subscribe_buildkite_webhook_deliveries_total{outcome="delivered"} 0')
+    expect(text).toContain("amp_subscribe_buildkite_webhook_signature_failures_total 0")
   })
 
   test("binding gauges track current state, including old-client regressions and deletion", async () => {
@@ -97,7 +103,7 @@ describe("metrics", () => {
     for (const row of app.database.list("T-test")) app.database.delete("T-test", row.id)
     for (const row of app.database.listFeeds("T-test")) app.database.deleteFeed("T-test", row.id)
     const empty = await app.metrics().text()
-    for (const source of ["github", "feed"]) {
+    for (const source of ["github", "feed", "buildkite"]) {
       for (const binding of ["legacy", "thread_v1"]) {
         expect(empty).toContain(`amp_subscribe_webhook_bindings{binding="${binding}",source="${source}"} 0`)
       }

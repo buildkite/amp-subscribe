@@ -5,6 +5,8 @@ import { hmacSha256 } from "../src/crypto"
 const config = {
   databasePath: ":memory:",
   githubWebhookSecret: "github-secret",
+  buildkiteWebhookSecret: "buildkite-secret",
+  buildkiteAllowedOrganizations: ["buildkite"],
   allowedWebhookHosts: ["example.test"],
   authenticate: async (request: Request) => {
     if (request.headers.get("authorization") !== "Bearer oidc-token") throw new Error("unauthorized")
@@ -51,6 +53,30 @@ function feedApiRequest(body: unknown, method = "POST", threadID?: string) {
       ...(threadID ? { "x-test-thread-id": threadID } : {}),
     },
     body: method === "GET" ? undefined : JSON.stringify(body),
+  })
+}
+
+function buildkiteApiRequest(body: unknown, method = "POST", threadID?: string) {
+  return new Request("https://bridge.test/api/buildkite-subscriptions", {
+    method,
+    headers: {
+      authorization: "Bearer oidc-token",
+      "content-type": "application/json",
+      ...(threadID ? { "x-test-thread-id": threadID } : {}),
+    },
+    body: method === "GET" ? undefined : JSON.stringify(body),
+  })
+}
+
+async function buildkiteWebhookRequest(body: string, timestamp = Math.floor(Date.now() / 1_000)) {
+  const signature = (await hmacSha256("buildkite-secret", `${timestamp}.${body}`)).slice("sha256=".length)
+  return new Request("https://bridge.test/buildkite/webhook", {
+    method: "POST",
+    headers: {
+      "x-buildkite-event": "build.finished",
+      "x-buildkite-signature": `timestamp=${timestamp},signature=${signature}`,
+    },
+    body,
   })
 }
 
@@ -137,7 +163,10 @@ describe("subscription bridge", () => {
     expect(app.database.list("T-other")).toEqual(otherGitHub)
     expect(app.database.listFeeds("T-other")).toEqual(otherFeeds)
     const logs = info.mock.calls.map(([line]) => JSON.parse(String(line)))
-    expect(logs.map((line) => line.changed)).toEqual([{ github: 1, feed: 1 }, { github: 0, feed: 0 }])
+    expect(logs.map((line) => line.changed)).toEqual([
+      { github: 1, feed: 1, buildkite: 0 },
+      { github: 0, feed: 0, buildkite: 0 },
+    ])
     expect(logs[0]).toMatchObject({ event: "webhook_binding_updated", threadId: "T-test", webhookBinding: "thread_v1" })
     expect(JSON.stringify(logs)).not.toContain(webhookUrl)
     const listed = await app.fetch(apiRequest(undefined, "GET"))
@@ -207,6 +236,77 @@ describe("subscription bridge", () => {
     expect(await response.text()).not.toContain("secret-capability")
     expect(app.database.list("T-test")).toHaveLength(1)
     expect(app.database.list("T-attacker-controlled")).toHaveLength(0)
+  })
+
+  test("registers, routes, and deduplicates Buildkite pipeline subscriptions", async () => {
+    const app = bridge()
+    for (const [threadID, deliveryMode] of [["T-buildkite-one", "queue"], ["T-buildkite-two", "steer"]] as const) {
+      const response = await app.fetch(buildkiteApiRequest({
+        organization: "buildkite",
+        pipeline: "amp-subscribe",
+        webhookUrl: "https://hooks.example.test/secret-capability",
+        webhookBinding: "thread_v1",
+        events: ["build.finished", "build.skipped"],
+        behavior: "investigate",
+        deliveryMode,
+      }, "POST", threadID))
+      expect(response.status).toBe(201)
+      expect(await response.text()).not.toContain("secret-capability")
+    }
+    const forwarded: Array<{ body: string; idempotencyKey: string | null }> = []
+    spyOn(globalThis, "fetch").mockImplementation((async (_input, init) => {
+      forwarded.push({ body: String(init?.body), idempotencyKey: new Headers(init?.headers).get("idempotency-key") })
+      return new Response(null, { status: 202 })
+    }) as typeof fetch)
+    const body = JSON.stringify({
+      event: "build.finished",
+      pipeline: {
+        id: "849411f9-9e6d-4739-a0d8-e247088e9b52",
+        slug: "amp-subscribe",
+        web_url: "https://buildkite.com/buildkite/amp-subscribe",
+      },
+      build: {
+        id: "f62a1b4d-10f9-4790-bc1c-e2c3a0c80983",
+        number: 42,
+        state: "failed",
+        blocked: false,
+        branch: "main",
+        commit: "a".repeat(40),
+        web_url: "https://buildkite.com/buildkite/amp-subscribe/builds/42",
+        created_at: "2026-09-21T09:00:00.000Z",
+        finished_at: "2026-09-21T09:05:00.000Z",
+        message: "UNTRUSTED_SENTINEL",
+        env: { SECRET: "UNTRUSTED_SENTINEL" },
+      },
+    })
+
+    expect((await app.fetch(await buildkiteWebhookRequest(body))).status).toBe(202)
+    expect((await app.fetch(await buildkiteWebhookRequest(body))).status).toBe(202)
+    expect(forwarded).toHaveLength(2)
+    expect(forwarded.map((item) => JSON.parse(item.body).targetThreadID).sort())
+      .toEqual(["T-buildkite-one", "T-buildkite-two"])
+    expect(forwarded.map((item) => JSON.parse(item.body).deliveryMode).sort()).toEqual(["queue", "steer"])
+    expect(new Set(forwarded.map((item) => item.idempotencyKey)).size).toBe(2)
+    expect(forwarded.every((item) => !item.body.includes("UNTRUSTED_SENTINEL"))).toBe(true)
+    expect(app.database.listBuildkite("T-buildkite-one")).toHaveLength(1)
+    const listed = await app.fetch(buildkiteApiRequest(undefined, "GET", "T-buildkite-one"))
+    expect(await listed.json()).toMatchObject({ subscriptions: [{ organization: "buildkite", pipeline: "amp-subscribe" }] })
+  })
+
+  test("rejects stale Buildkite signatures and subscriptions outside allowed organizations", async () => {
+    const app = bridge()
+    const registration = await app.fetch(buildkiteApiRequest({
+      organization: "other-org",
+      pipeline: "private-pipeline",
+      webhookUrl: "https://hooks.example.test/secret-capability",
+      events: ["build.finished"],
+      behavior: "notify",
+    }))
+    expect(registration.status).toBe(400)
+    expect(await registration.json()).toEqual({ error: "organization is not allowed" })
+
+    const stale = await app.fetch(await buildkiteWebhookRequest("{}", Math.floor(Date.now() / 1_000) - 301))
+    expect(stale.status).toBe(401)
   })
 
   test("routes and deduplicates shared-webhook GitHub subscriptions by authenticated thread", async () => {

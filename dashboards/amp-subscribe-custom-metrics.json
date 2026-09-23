@@ -62,7 +62,7 @@
         "type": "prometheus",
         "uid": "prometheus_on_fly"
       },
-      "description": "amp_subscribe_feed_subscriptions gauge, by app",
+      "description": "amp_subscribe_feed_subscriptions and amp_subscribe_buildkite_subscriptions gauges, by app",
       "fieldConfig": {
         "defaults": {
           "min": 0
@@ -93,12 +93,23 @@
           },
           "expr": "amp_subscribe_feed_subscriptions{app=~\"$app\"}",
           "instant": true,
-          "legendFormat": "{{app}}",
+          "legendFormat": "{{app}} - feed",
           "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "amp_subscribe_buildkite_subscriptions{app=~\"$app\"}",
+          "instant": true,
+          "legendFormat": "{{app}} - Buildkite",
+          "range": false,
+          "refId": "B"
         }
       ],
-      "title": "Current feed subscriptions",
+      "title": "Current feed and Buildkite subscriptions",
       "type": "stat"
     },
     {
@@ -111,7 +122,7 @@
       },
       "id": 101,
       "panels": [],
-      "title": "GitHub webhook activity",
+      "title": "Webhook activity",
       "type": "row"
     },
     {
@@ -119,7 +130,7 @@
         "type": "prometheus",
         "uid": "prometheus_on_fly"
       },
-      "description": "amp_subscribe_webhook_events_received_total, by GitHub event type",
+      "description": "GitHub and Buildkite webhook events received, by event type",
       "fieldConfig": {
         "defaults": {
           "unit": "reqps"
@@ -140,8 +151,17 @@
             "uid": "prometheus_on_fly"
           },
           "expr": "sum(rate(amp_subscribe_webhook_events_received_total{app=~\"$app\"}[5m])) by (app, event)",
-          "legendFormat": "{{app}} - {{event}}",
+          "legendFormat": "{{app}} - GitHub - {{event}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_buildkite_webhook_events_received_total{app=~\"$app\"}[5m])) by (app, event)",
+          "legendFormat": "{{app}} - Buildkite - {{event}}",
+          "refId": "B"
         }
       ],
       "title": "Webhook events received (rate)",
@@ -152,7 +172,7 @@
         "type": "prometheus",
         "uid": "prometheus_on_fly"
       },
-      "description": "amp_subscribe_webhook_signature_failures_total - should normally sit at zero; a sustained non-zero rate usually means a misconfigured GITHUB_WEBHOOK_SECRET",
+      "description": "GitHub and Buildkite webhook signature failures - should normally sit at zero; a sustained non-zero rate usually means a misconfigured webhook secret",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -176,8 +196,17 @@
             "uid": "prometheus_on_fly"
           },
           "expr": "sum(rate(amp_subscribe_webhook_signature_failures_total{app=~\"$app\"}[5m])) by (app)",
-          "legendFormat": "{{app}}",
+          "legendFormat": "{{app}} - GitHub",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_buildkite_webhook_signature_failures_total{app=~\"$app\"}[5m])) by (app)",
+          "legendFormat": "{{app}} - Buildkite",
+          "refId": "B"
         }
       ],
       "title": "Webhook signature failures (rate)",
@@ -221,7 +250,7 @@
         "type": "prometheus",
         "uid": "prometheus_on_fly"
       },
-      "description": "amp_subscribe_webhook_deliveries_total - attempts to forward a matched event to an Amp durable webhook",
+      "description": "GitHub and Buildkite attempts to forward a matched event to an Amp durable webhook",
       "fieldConfig": {
         "defaults": {
           "unit": "reqps"
@@ -242,8 +271,17 @@
             "uid": "prometheus_on_fly"
           },
           "expr": "sum(rate(amp_subscribe_webhook_deliveries_total{app=~\"$app\"}[5m])) by (app, outcome)",
-          "legendFormat": "{{app}} - {{outcome}}",
+          "legendFormat": "{{app}} - GitHub - {{outcome}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus_on_fly"
+          },
+          "expr": "sum(rate(amp_subscribe_buildkite_webhook_deliveries_total{app=~\"$app\"}[5m])) by (app, outcome)",
+          "legendFormat": "{{app}} - Buildkite - {{outcome}}",
+          "refId": "B"
         }
       ],
       "title": "Webhook delivery outcomes (rate)",

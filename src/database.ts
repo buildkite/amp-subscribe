@@ -1,11 +1,22 @@
 import { Database } from "bun:sqlite"
-import type { FeedEntry, FeedSubscription, Subscription, SubscriptionBehavior, SubscriptionDeliveryMode, SubscriptionEvent, WebhookBinding } from "./types"
+import type {
+  BuildkiteEvent,
+  BuildkiteSubscription,
+  FeedEntry,
+  FeedSubscription,
+  Subscription,
+  SubscriptionBehavior,
+  SubscriptionDeliveryMode,
+  SubscriptionEvent,
+  WebhookBinding,
+} from "./types"
 
 type WithoutStoredFields<T> = T extends unknown ? Omit<T, "id" | "createdAt" | "webhookBinding"> : never
 type WithOptionalDeliveryMode<T> = T extends unknown
   ? Omit<T, "deliveryMode"> & { deliveryMode?: SubscriptionDeliveryMode }
   : never
 type SubscriptionInput = WithOptionalDeliveryMode<WithoutStoredFields<Subscription>>
+type BuildkiteSubscriptionInput = WithOptionalDeliveryMode<WithoutStoredFields<BuildkiteSubscription>>
 
 interface SubscriptionRow {
   id: string
@@ -31,6 +42,19 @@ interface FeedSubscriptionRow {
   behavior: SubscriptionBehavior
   etag: string | null
   last_modified: string | null
+  created_at: string
+}
+
+interface BuildkiteSubscriptionRow {
+  id: string
+  thread_id: string
+  organization: string
+  pipeline: string
+  webhook_url: string
+  webhook_binding: WebhookBinding
+  events: string
+  behavior: SubscriptionBehavior
+  delivery_mode: SubscriptionDeliveryMode
   created_at: string
 }
 
@@ -65,6 +89,21 @@ function mapSubscription(row: SubscriptionRow): Subscription {
   }
   if (row.target_type === "repository") return { ...common, targetType: "repository" }
   return { ...common, targetType: "pull_request", pullRequestNumber: row.pull_request_number ?? Number(row.target) }
+}
+
+function mapBuildkiteSubscription(row: BuildkiteSubscriptionRow): BuildkiteSubscription {
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    organization: row.organization,
+    pipeline: row.pipeline,
+    webhookUrl: row.webhook_url,
+    webhookBinding: row.webhook_binding,
+    events: JSON.parse(row.events) as BuildkiteEvent[],
+    behavior: row.behavior,
+    deliveryMode: row.delivery_mode,
+    createdAt: row.created_at,
+  }
 }
 
 export class SubscriptionDatabase {
@@ -125,6 +164,31 @@ export class SubscriptionDatabase {
         seen_at TEXT NOT NULL,
         PRIMARY KEY(subscription_id, entry_id),
         FOREIGN KEY(subscription_id) REFERENCES feed_subscriptions(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS buildkite_subscriptions (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        organization TEXT NOT NULL,
+        pipeline TEXT NOT NULL,
+        webhook_url TEXT NOT NULL,
+        webhook_binding TEXT NOT NULL DEFAULT 'legacy'
+          CHECK(webhook_binding IN ('legacy', 'thread_v1')),
+        events TEXT NOT NULL,
+        behavior TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL DEFAULT 'automatic'
+          CHECK(delivery_mode IN ('automatic', 'queue', 'steer')),
+        created_at TEXT NOT NULL,
+        UNIQUE(thread_id, organization, pipeline)
+      );
+      CREATE INDEX IF NOT EXISTS buildkite_subscriptions_target
+        ON buildkite_subscriptions(organization, pipeline);
+      CREATE TABLE IF NOT EXISTS buildkite_deliveries (
+        subscription_id TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        delivered_at TEXT NOT NULL,
+        PRIMARY KEY(subscription_id, delivery_id, event),
+        FOREIGN KEY(subscription_id) REFERENCES buildkite_subscriptions(id) ON DELETE CASCADE
       );
     `)
     // Existing endpoints are unclassified until an updated plugin registers them.
@@ -296,6 +360,12 @@ export class SubscriptionDatabase {
     ).get()?.count ?? 0
   }
 
+  countBuildkiteSubscriptions(): number {
+    return this.sqlite.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM buildkite_subscriptions",
+    ).get()?.count ?? 0
+  }
+
   list(threadId: string): Subscription[] {
     return this.sqlite.query<SubscriptionRow, [string]>(
       "SELECT * FROM subscriptions WHERE thread_id = ? ORDER BY created_at",
@@ -310,7 +380,10 @@ export class SubscriptionDatabase {
       const feed = this.sqlite.query(`UPDATE feed_subscriptions SET webhook_url = ?, webhook_binding = ?
         WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
         .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
-      return { github, feed }
+      const buildkite = this.sqlite.query(`UPDATE buildkite_subscriptions SET webhook_url = ?, webhook_binding = ?
+        WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
+        .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
+      return { github, feed, buildkite }
     })()
   }
 
@@ -320,6 +393,8 @@ export class SubscriptionDatabase {
       FROM subscriptions GROUP BY webhook_binding
       UNION ALL
       SELECT 'feed', webhook_binding, COUNT(*) FROM feed_subscriptions GROUP BY webhook_binding
+      UNION ALL
+      SELECT 'buildkite', webhook_binding, COUNT(*) FROM buildkite_subscriptions GROUP BY webhook_binding
     `).all()
   }
 
@@ -347,6 +422,81 @@ export class SubscriptionDatabase {
   markDelivered(subscriptionId: string, deliveryId: string, event: string): void {
     this.sqlite.query(`
       INSERT OR IGNORE INTO deliveries (subscription_id, delivery_id, event, delivered_at)
+      VALUES (?, ?, ?, ?)
+    `).run(subscriptionId, deliveryId, event, new Date().toISOString())
+  }
+
+  upsertBuildkite(
+    input: BuildkiteSubscriptionInput,
+    webhookBinding: WebhookBinding = "legacy",
+  ): BuildkiteSubscription {
+    const organization = input.organization.toLowerCase()
+    const pipeline = input.pipeline.toLowerCase()
+    const existing = this.sqlite.query<BuildkiteSubscriptionRow, [string, string, string]>(`
+      SELECT * FROM buildkite_subscriptions WHERE thread_id = ? AND organization = ? AND pipeline = ?
+    `).get(input.threadId, organization, pipeline)
+    const subscription: BuildkiteSubscription = {
+      ...input,
+      organization,
+      pipeline,
+      deliveryMode: input.deliveryMode ?? existing?.delivery_mode ?? "automatic",
+      id: existing?.id ?? crypto.randomUUID(),
+      createdAt: existing?.created_at ?? new Date().toISOString(),
+      webhookBinding,
+    }
+    this.sqlite.query(`
+      INSERT INTO buildkite_subscriptions
+        (id, thread_id, organization, pipeline, webhook_url, webhook_binding, events, behavior, delivery_mode, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(thread_id, organization, pipeline) DO UPDATE SET
+        webhook_url = excluded.webhook_url,
+        webhook_binding = excluded.webhook_binding,
+        events = excluded.events,
+        behavior = excluded.behavior,
+        delivery_mode = excluded.delivery_mode
+    `).run(
+      subscription.id,
+      subscription.threadId,
+      subscription.organization,
+      subscription.pipeline,
+      subscription.webhookUrl,
+      subscription.webhookBinding,
+      JSON.stringify(subscription.events),
+      subscription.behavior,
+      subscription.deliveryMode,
+      subscription.createdAt,
+    )
+    return subscription
+  }
+
+  listBuildkite(threadId: string): BuildkiteSubscription[] {
+    return this.sqlite.query<BuildkiteSubscriptionRow, [string]>(`
+      SELECT * FROM buildkite_subscriptions WHERE thread_id = ? ORDER BY created_at
+    `).all(threadId).map(mapBuildkiteSubscription)
+  }
+
+  matchingBuildkite(organization: string, pipeline: string, event: BuildkiteEvent): BuildkiteSubscription[] {
+    return this.sqlite.query<BuildkiteSubscriptionRow, [string, string]>(`
+      SELECT * FROM buildkite_subscriptions WHERE organization = ? AND pipeline = ?
+    `).all(organization.toLowerCase(), pipeline.toLowerCase()).map(mapBuildkiteSubscription)
+      .filter((subscription) => subscription.events.includes(event))
+  }
+
+  deleteBuildkite(threadId: string, id: string, webhookUrl: string | null = null): boolean {
+    return this.sqlite.query(`
+      DELETE FROM buildkite_subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
+    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
+  }
+
+  wasBuildkiteDelivered(subscriptionId: string, deliveryId: string, event: string): boolean {
+    return this.sqlite.query(`
+      SELECT 1 FROM buildkite_deliveries WHERE subscription_id = ? AND delivery_id = ? AND event = ?
+    `).get(subscriptionId, deliveryId, event) !== null
+  }
+
+  markBuildkiteDelivered(subscriptionId: string, deliveryId: string, event: string): void {
+    this.sqlite.query(`
+      INSERT OR IGNORE INTO buildkite_deliveries (subscription_id, delivery_id, event, delivered_at)
       VALUES (?, ?, ?, ?)
     `).run(subscriptionId, deliveryId, event, new Date().toISOString())
   }

@@ -16,8 +16,8 @@ GitHub: A check failed on acme/widgets#123.
 Amp: The Linux test job failed because...
 ```
 
-GitHub repositories, pull requests, and branches, plus RSS and Atom feeds, are supported today. The
-bridge is designed to support other event sources, such as Slack, in the future.
+GitHub repositories, pull requests, and branches, Buildkite pipelines, plus RSS and Atom feeds are
+supported today. The bridge is designed to support other event sources, such as Slack, in the future.
 
 ## Why use it?
 
@@ -28,8 +28,8 @@ bridge is designed to support other event sources, such as Slack, in the future.
 
 ## Quick start
 
-You need a running amp-subscribe bridge and its GitHub App installed on the repositories you want to
-watch. To run your own bridge, see [Self-hosting](#self-hosting).
+You need a running amp-subscribe bridge and the source webhook configured for what you want to watch.
+To run your own bridge, see [Self-hosting](#self-hosting).
 
 1. Install [`plugin/subscribe.ts`](plugin/subscribe.ts) as
    `.amp/plugins/subscribe.ts` for one project or
@@ -71,6 +71,16 @@ watch. To run your own bridge, see [Self-hosting](#self-hosting).
    Repository subscriptions report only newly opened pull requests and issues; later activity can
    be followed with a pull request subscription.
 
+   Or watch a Buildkite pipeline:
+
+   ```text
+   Subscribe this thread to buildkite/my-pipeline and investigate failed builds.
+   ```
+
+   Buildkite subscriptions default to finished and skipped builds. Scheduled, running, and failing
+   lifecycle events can be selected explicitly. Investigation requires authenticated Buildkite
+   access in the orb, such as the Buildkite MCP server or `bk` CLI.
+
    Or subscribe to a feed:
 
    ```text
@@ -88,11 +98,11 @@ durable webhook URLs, so renaming it would disconnect existing subscriptions.
 Deploy the updated bridge **before** updating the plugin. On startup, the plugin registers
 `github-pr-events:<AMP_THREAD_ID>` and calls `PUT /api/webhook` with
 `{ "webhookUrl": "...", "webhookBinding": "thread_v1" }`.
-The bridge authenticates the orb and atomically moves only that thread's GitHub and feed
+The bridge authenticates the orb and atomically moves only that thread's GitHub, Buildkite, and feed
 subscriptions to the new URL. Subscription IDs, behaviors, delivery modes, event filters, delivery
-history, and feed baselines are preserved. Startup adds a `webhook_binding` column to both
-subscription tables, defaulting existing rows to `legacy`, and defaults existing GitHub
-subscriptions to `automatic` delivery. Repeated plugin loads use the same key
+history, and feed baselines are preserved. Existing GitHub and feed tables gain a `webhook_binding`
+column defaulting to `legacy`; new Buildkite rows include the binding from creation. Existing GitHub
+subscriptions default to `automatic` delivery. Repeated plugin loads use the same key
 and safely repeat the update. An older bridge lacks this endpoint, so plugin initialization fails
 until the bridge is upgraded and the plugin is reloaded.
 
@@ -112,9 +122,9 @@ persists it and returns it in subscription lists. Omitted bindings mean `legacy`
 updates: an old plugin writing a shared URL clears the migrated marker. This is a client-declared
 version, not independent proof of Amp webhook ownership, handler execution, or successful wakeup.
 
-Watch `amp_subscribe_webhook_bindings{binding="legacy"}` for both `source="github"` and
-`source="feed"`; [dashboard queries](dashboards/README.md#webhook-migration) are provided. It counts
-current subscriptions, not distinct threads or cumulative migrations. All four binding/source series
+Watch `amp_subscribe_webhook_bindings{binding="legacy"}` for `source="github"`, `source="buildkite"`,
+and `source="feed"`; [dashboard queries](dashboards/README.md#webhook-migration) are provided. It counts
+current subscriptions, not distinct threads or cumulative migrations. All six binding/source series
 are emitted even at zero. Missing metrics or an unavailable scrape must not be interpreted as zero.
 
 To identify remaining threads without exposing capability URLs, run this query against a read-only
@@ -126,6 +136,9 @@ FROM subscriptions WHERE webhook_binding = 'legacy'
 UNION ALL
 SELECT 'feed', id, thread_id, webhook_binding
 FROM feed_subscriptions WHERE webhook_binding = 'legacy'
+UNION ALL
+SELECT 'buildkite', id, thread_id, webhook_binding
+FROM buildkite_subscriptions WHERE webhook_binding = 'legacy'
 ORDER BY thread_id, source, id;
 ```
 
@@ -169,24 +182,25 @@ subscriptions.
 ## How it works
 
 ```text
-GitHub App ──webhook──┐
-                     ├──▶ amp-subscribe ──durable webhook──▶ Amp thread
-RSS/Atom ───poll──────┘          ▲                                │
-                                └──────── subscription ──────────┘
+GitHub App ──webhook──────┐
+Buildkite ───webhook──────┼──▶ amp-subscribe ──durable webhook──▶ Amp thread
+RSS/Atom ───poll──────────┘          ▲                                │
+                                    └──────── subscription ──────────┘
 ```
 
-The plugin creates **one durable webhook per thread**, shared only by that thread's GitHub and feed
-subscriptions. Amp shares registrations for the same user/project/plugin/key, so the key includes
-the orb's `AMP_THREAD_ID` instead of using one fixed project-wide key. Registration happens when the
-plugin loads, including on orb restart, without waiting for a tool call or session-start event.
+The plugin creates **one durable webhook per thread**, shared only by that thread's GitHub,
+Buildkite, and feed subscriptions. Amp shares registrations for the same user/project/plugin/key,
+so the key includes the orb's `AMP_THREAD_ID` instead of using one fixed project-wide key.
+Registration happens when the plugin loads, including on orb restart, without waiting for a tool
+call or session-start event.
 Missing thread identity is an error; the plugin does not fall back to a shared key or UI focus.
 
 The bridge stores the authenticated subscribing thread ID, verifies matching GitHub events, and
 forwards bounded metadata with that trusted target ID. The handler checks that its registration
 owner, orb thread, and payload target all agree, then appends to the owning thread. It never forwards
 to another thread. This isolates active subscribers from an unrelated thread's archived webhook
-owner. Amp can store events and wake the owning thread while its orb is asleep. Feed events use
-the same routing contract.
+owner. Amp can store events and wake the owning thread while its orb is asleep. Buildkite and feed
+events use the same routing contract.
 
 For feeds, the bridge polls public HTTPS URLs every five minutes by default. Set
 `FEED_POLL_INTERVAL_SECONDS` to change the interval (minimum 30 seconds). Conditional requests are
@@ -196,7 +210,8 @@ The bridge drops queued and in-progress check lifecycle events before they consu
 capacity. GitHub subscriptions accept a delivery mode: `queue` never steers, `steer` always steers,
 and `automatic` (the default) also steers all delivered events. This applies to existing `automatic`
 subscriptions and payloads without a delivery mode; explicit `queue` subscriptions stay queued.
-Feed events also steer. This does not clear messages already queued in a thread.
+Buildkite subscriptions use the same delivery modes. Feed events always steer. This does not clear
+messages already queued in a thread.
 For pull requests, a successful check
 triggers an authenticated `gh` lookup: the plugin
 suppresses stale and still-pending results, then reports at most once per head after every check in
@@ -238,6 +253,9 @@ Edit `.env` to set:
   allowlist.
 - `AMP_OIDC_AUDIENCE` to the audience configured in the plugin.
 - `AMP_WEBHOOK_ALLOWED_HOSTS` to the host or parent domain used by Amp durable webhooks.
+- `BUILDKITE_WEBHOOK_SECRET` to the Buildkite webhook token configured in signature mode.
+- `BUILDKITE_ALLOWED_ORGANIZATIONS` to the comma-separated Buildkite organization slugs this bridge
+  may accept and expose to subscribers.
 
 Create the GitHub App with its required events and read-only permissions, and save its generated
 webhook secret to `.env`:
@@ -251,6 +269,10 @@ the GitHub organization that should own the app,
 then opens GitHub's App Manifest flow. After creating the app, install it on the repositories you
 want to watch. Leave the organization blank to create a personal app. For manual setup, see
 [GitHub App setup](docs/github-app.md).
+
+Configure one organization-level Buildkite webhook notification service for the pipelines and build
+events you want the bridge to route. Point it to `/buildkite/webhook`, use signature mode, and use the
+same token as `BUILDKITE_WEBHOOK_SECRET`. See [Buildkite webhook setup](docs/buildkite.md).
 
 Start the bridge with:
 
@@ -274,11 +296,13 @@ Bridge stdout/stderr includes structured JSON events:
 - `subscription_registered`, `subscription_unsubscribed`: source, authenticated thread ID and
   subscription ID; registration includes the binding version.
 - `webhook_binding_updated`: thread ID, binding version, endpoint SHA-256 fingerprint and changed
-  GitHub/feed row counts. Repeated startup updates report zero changed rows.
+  GitHub/Buildkite/feed row counts. Repeated startup updates report zero changed rows.
 - `legacy_webhook_rejected`: a retired client attempted a legacy binding write.
 - `github_webhook_processed`: GitHub delivery GUID, event type, normalized event count, matched
   subscription/event pairs, deduplicated, suppressed, delivered, failed and removed counts. This
   distinguishes zero matches from a retry that was already accepted.
+- `buildkite_webhook_processed`: content-derived delivery ID, event, organization/pipeline, matched
+  subscriptions, deduplicated, delivered, failed and removed counts.
 - `webhook_delivery_failed`, `subscription_removed`: subscription/thread IDs, binding version,
   exact HTTP status (or `null` for a transport failure), reason, idempotency key, endpoint host/hash
   and bounded `x-request-id`/`fly-request-id` response headers. These correlate a failed GitHub
@@ -303,11 +327,11 @@ mise exec -- flyctl tokens create deploy --app bk-amp-subscribe --expiry 8760h |
 ```
 
 Before the first deployment, create the app in Buildkite's Fly organization if needed and set its
-`GITHUB_WEBHOOK_SECRET` and Amp allowlist secrets. Point the GitHub App webhook to
-`https://bk-amp-subscribe.fly.dev/github/webhook` and clients' `AMP_SUBSCRIBE_URL` to
-`https://bk-amp-subscribe.fly.dev` when cutting over. The existing OIDC audiences are retained for
-client compatibility. The old app's SQLite subscriptions do not move automatically; migrate the
-database or recreate subscriptions on the new app.
+GitHub and Buildkite webhook secrets, Buildkite organization allowlist, and Amp allowlist secrets.
+Point the GitHub App webhook to `https://bk-amp-subscribe.fly.dev/github/webhook` and clients'
+`AMP_SUBSCRIBE_URL` to `https://bk-amp-subscribe.fly.dev` when cutting over. The existing OIDC
+audiences are retained for client compatibility. The old app's SQLite subscriptions do not move
+automatically; migrate the database or recreate subscriptions on the new app.
 
 For a separate self-hosted deployment, change the app name, region, and OIDC audience, then create
 the app and set its secrets:
@@ -316,7 +340,10 @@ the app and set its secrets:
 APP=your-amp-subscribe-app
 mise exec -- flyctl apps create "$APP"
 mise exec -- flyctl secrets set --app "$APP" \
-  GITHUB_WEBHOOK_SECRET=... AMP_ALLOWED_WORKSPACE_IDS=...
+  GITHUB_WEBHOOK_SECRET=... \
+  BUILDKITE_WEBHOOK_SECRET=... \
+  BUILDKITE_ALLOWED_ORGANIZATIONS=... \
+  AMP_ALLOWED_WORKSPACE_IDS=...
 mise exec -- flyctl deploy --remote-only --app "$APP"
 ```
 
@@ -324,13 +351,17 @@ mise exec -- flyctl deploy --remote-only --app "$APP"
 
 The subscription API authenticates Amp with short-lived workload identity tokens and derives the
 thread owner from the signed identity. Forwarded target thread IDs come only from those authenticated
-subscription records, not GitHub or feed content. GitHub webhooks are signature-checked, delivery
-IDs are deduplicated per subscription, and outbound delivery is restricted to configured HTTPS
-hosts.
+subscription records, not GitHub, Buildkite, or feed content. GitHub and Buildkite webhooks are
+signature-checked, deliveries are deduplicated per subscription, and outbound delivery is restricted
+to configured HTTPS hosts. Buildkite signatures older than five minutes are rejected.
 
 amp-subscribe forwards bounded event metadata, not untrusted PR titles, comments, check output,
 commit messages, patches, or filenames. Amp fetches that content through its normal GitHub tools
 when it investigates an event.
+
+Buildkite forwarding is similarly limited to pipeline/build IDs, state, branch, commit, canonical
+URLs, and timestamps. It excludes build messages, environment variables, job logs, and annotations;
+Amp retrieves current details using its separately authenticated Buildkite tools.
 
 Feed downloads are limited to public HTTPS endpoints and 1 MiB. Forwarded feed events contain
 bounded entry metadata but not descriptions or body content; the plugin treats feed titles and
