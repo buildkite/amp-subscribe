@@ -81,6 +81,13 @@ To run your own bridge, see [Self-hosting](#self-hosting).
    lifecycle events can be selected explicitly. Investigation requires authenticated Buildkite
    access in the orb, such as the Buildkite MCP server or `bk` CLI.
 
+   Without filters, a Buildkite subscription watches **all branches and commits** in that pipeline.
+   To watch CI after pushing, pass the full pushed SHA as `commit` to `buildkite_pipeline_subscribe`.
+   An optional `branch` filter matches the exact, case-sensitive branch name; when both filters are
+   set, both must match. Re-subscribing to the same pipeline replaces the filters, so update `commit`
+   after each push. Omitted filters are cleared. A build URL selects its pipeline, not one build.
+   See [Buildkite subscription filters](docs/buildkite.md#subscription-filters) for an example.
+
    Or subscribe to a feed:
 
    ```text

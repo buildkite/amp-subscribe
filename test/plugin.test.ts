@@ -171,6 +171,7 @@ async function captureWebhookHandler(
   messages: (threadID: string) => Promise<unknown[]> = async () => [],
   threadID = "T-target-thread",
   registrationKeys: string[] = [],
+  tools: Array<Parameters<PluginAPI["registerTool"]>[0]> = [],
 ): Promise<CapturedWebhookHandler> {
   let handler: CapturedWebhookHandler | undefined
   const previous = { AMP_ORB: process.env.AMP_ORB, AMP_THREAD_ID: process.env.AMP_THREAD_ID, AMP_SUBSCRIBE_URL: process.env.AMP_SUBSCRIBE_URL }
@@ -198,7 +199,7 @@ async function captureWebhookHandler(
       threads: { get: () => { throw new Error("must not route to another thread") } },
       activeThread: { current: { id: "T-unrelated-ui-focus" } },
       on: () => undefined,
-      registerTool: () => undefined,
+      registerTool: (tool: Parameters<PluginAPI["registerTool"]>[0]) => { tools.push(tool) },
       helpers: { shellCommandFromToolCall: () => null },
     } as unknown as PluginAPI)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
@@ -216,6 +217,64 @@ async function captureWebhookHandler(
   if (!handler) throw new Error("Webhook handler was not registered")
   return handler
 }
+
+describe("buildkite_pipeline_subscribe", () => {
+  test("passes exact filters to the bridge and makes the subscription scope explicit", async () => {
+    const tools: Array<Parameters<PluginAPI["registerTool"]>[0]> = []
+    await captureWebhookHandler(undefined, undefined, undefined, undefined, undefined, undefined, tools)
+    const tool = tools.find((tool) => tool.name === "buildkite_pipeline_subscribe")!
+    const previousUrl = process.env.AMP_SUBSCRIBE_URL
+    process.env.AMP_SUBSCRIBE_URL = "https://bridge.example.test"
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (_input, _init) => Response.json({
+      subscription: { id: "sub-buildkite", deliveryMode: "steer", branch: "Feature/CI", commit: "a1".repeat(20) },
+    })) as typeof fetch)
+    try {
+      const commit = "A1".repeat(20)
+      const output = await tool.execute({
+        pipeline: "buildkite/amp-subscribe", branch: "Feature/CI", commit,
+        events: ["build.failing", "build.finished"], behavior: "implement", deliveryMode: "steer",
+      }, {} as never)
+      expect(fetchSpy.mock.calls[0]![0]).toBe("https://bridge.example.test/api/buildkite-subscriptions")
+      expect(JSON.parse(String(fetchSpy.mock.calls[0]![1]?.body))).toEqual({
+        organization: "buildkite", pipeline: "amp-subscribe", branch: "Feature/CI", commit,
+        events: ["build.failing", "build.finished"], behavior: "implement", deliveryMode: "steer",
+        webhookUrl: "https://hooks.example.test/github-pr-events:T-target-thread", webhookBinding: "thread_v1",
+      })
+      expect(output).toContain('branch "Feature/CI"')
+      expect(output).toContain(`commit ${commit.toLowerCase()}`)
+      expect(output).toContain("sub-buildkite")
+
+      fetchSpy.mockImplementation((async (_input, _init) => Response.json({
+        subscription: { id: "sub-buildkite", deliveryMode: "steer" },
+      })) as typeof fetch)
+      const unfiltered = await tool.execute({ pipeline: "https://buildkite.com/buildkite/amp-subscribe/builds/42" }, {} as never)
+      expect(unfiltered).toContain("all branches; all commits")
+      expect(JSON.parse(String(fetchSpy.mock.calls[1]![1]?.body))).not.toHaveProperty("commit")
+      expect(JSON.parse(String(fetchSpy.mock.calls[1]![1]?.body))).not.toHaveProperty("branch")
+      fetchSpy.mockClear()
+      for (const filters of [{ branch: "" }, { branch: 1 }, { branch: "main\n" }, { commit: null }, { commit: "abc1234" }]) {
+        await expect(tool.execute({ pipeline: "buildkite/amp-subscribe", ...filters }, {} as never)).rejects.toThrow()
+      }
+      expect(fetchSpy).not.toHaveBeenCalled()
+
+      // An older bridge silently accepts but drops filters. Do not leave that broad subscription active.
+      fetchSpy.mockImplementation((async (_url, init) => init?.method === "DELETE"
+        ? new Response(null, { status: 204 })
+        : Response.json({ subscription: { id: "sub-buildkite" } })) as typeof fetch)
+      await expect(tool.execute({ pipeline: "buildkite/amp-subscribe", branch: "Feature/CI", commit }, {} as never))
+        .rejects.toThrow("Removed the subscription; update the bridge before retrying")
+      expect(fetchSpy.mock.calls).toHaveLength(2)
+      expect(fetchSpy.mock.calls[1]).toMatchObject([
+        "https://bridge.example.test/api/buildkite-subscriptions",
+        { method: "DELETE", body: JSON.stringify({ id: "sub-buildkite" }) },
+      ])
+    } finally {
+      fetchSpy.mockRestore()
+      if (previousUrl === undefined) delete process.env.AMP_SUBSCRIBE_URL
+      else process.env.AMP_SUBSCRIBE_URL = previousUrl
+    }
+  })
+})
 
 function webhookInvocation(id: string, threadID = "T-target-thread") {
   const routineEvent = {

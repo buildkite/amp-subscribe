@@ -48,6 +48,37 @@ The API token is needed only to provision the notification service. Do not store
 Buildkite signs `timestamp.raw-body` with HMAC-SHA256; the bridge verifies the signature and rejects
 dispatch timestamps outside a five-minute window.
 
+## Subscription filters
+
+`buildkite_pipeline_subscribe` accepts optional `branch` and `commit` filters:
+
+```json
+{
+  "pipeline": "buildkite/my-pipeline",
+  "branch": "feature/my-change",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "events": ["build.failing", "build.finished"],
+  "behavior": "investigate",
+  "deliveryMode": "steer"
+}
+```
+
+Use the actual full pushed SHA for `commit`, not the example value. Branch names match exactly and
+are case-sensitive, without glob matching. Commits require a full 40- or 64-character hexadecimal
+SHA and match without regard to hex letter case. When both filters are supplied, both must match.
+A build without a valid full commit SHA cannot match a commit-filtered subscription.
+
+Without filters, all branches and commits in the pipeline are eligible. There is one subscription
+per thread and pipeline: re-subscribing replaces its filters, and omitted filters are cleared.
+After pushing again, re-subscribe with the new head SHA. Listing subscriptions returns the stored
+filters. A build URL passed as `pipeline` selects only its pipeline, not the individual build.
+
+The subscription API accepts the same optional `branch` and `commit` fields at
+`POST /api/buildkite-subscriptions`. Existing subscriptions remain unfiltered on upgrade, and the
+database migration preserves their IDs and delivery history. Deploy the updated bridge before
+updating the plugin; older bridges do not apply these filters. The updated plugin checks the saved
+filters and removes the subscription with an error if the bridge did not retain them.
+
 ## Investigation access
 
 The webhook intentionally excludes job data and logs. For `investigate` and `implement` behavior,

@@ -50,6 +50,8 @@ interface BuildkiteSubscriptionRow {
   thread_id: string
   organization: string
   pipeline: string
+  branch: string | null
+  commit_sha: string | null
   webhook_url: string
   webhook_binding: WebhookBinding
   events: string
@@ -97,6 +99,8 @@ function mapBuildkiteSubscription(row: BuildkiteSubscriptionRow): BuildkiteSubsc
     threadId: row.thread_id,
     organization: row.organization,
     pipeline: row.pipeline,
+    ...(row.branch !== null ? { branch: row.branch } : {}),
+    ...(row.commit_sha !== null ? { commit: row.commit_sha } : {}),
     webhookUrl: row.webhook_url,
     webhookBinding: row.webhook_binding,
     events: JSON.parse(row.events) as BuildkiteEvent[],
@@ -203,6 +207,12 @@ export class SubscriptionDatabase {
     if (!subscriptionColumns.some((column) => column.name === "delivery_mode")) {
       this.sqlite.exec(`ALTER TABLE subscriptions ADD COLUMN delivery_mode TEXT NOT NULL
         DEFAULT 'automatic' CHECK(delivery_mode IN ('automatic', 'queue', 'steer'))`)
+    }
+    const buildkiteColumns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(buildkite_subscriptions)").all()
+    for (const column of ["branch", "commit_sha"]) {
+      if (!buildkiteColumns.some((item) => item.name === column)) {
+        this.sqlite.exec(`ALTER TABLE buildkite_subscriptions ADD COLUMN ${column} TEXT`)
+      }
     }
   }
 
@@ -439,6 +449,7 @@ export class SubscriptionDatabase {
       ...input,
       organization,
       pipeline,
+      ...(input.commit !== undefined ? { commit: input.commit.toLowerCase() } : {}),
       deliveryMode: input.deliveryMode ?? existing?.delivery_mode ?? "automatic",
       id: existing?.id ?? crypto.randomUUID(),
       createdAt: existing?.created_at ?? new Date().toISOString(),
@@ -446,9 +457,11 @@ export class SubscriptionDatabase {
     }
     this.sqlite.query(`
       INSERT INTO buildkite_subscriptions
-        (id, thread_id, organization, pipeline, webhook_url, webhook_binding, events, behavior, delivery_mode, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, thread_id, organization, pipeline, branch, commit_sha, webhook_url, webhook_binding, events, behavior, delivery_mode, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(thread_id, organization, pipeline) DO UPDATE SET
+        branch = excluded.branch,
+        commit_sha = excluded.commit_sha,
         webhook_url = excluded.webhook_url,
         webhook_binding = excluded.webhook_binding,
         events = excluded.events,
@@ -459,6 +472,8 @@ export class SubscriptionDatabase {
       subscription.threadId,
       subscription.organization,
       subscription.pipeline,
+      subscription.branch ?? null,
+      subscription.commit ?? null,
       subscription.webhookUrl,
       subscription.webhookBinding,
       JSON.stringify(subscription.events),
@@ -475,11 +490,13 @@ export class SubscriptionDatabase {
     `).all(threadId).map(mapBuildkiteSubscription)
   }
 
-  matchingBuildkite(organization: string, pipeline: string, event: BuildkiteEvent): BuildkiteSubscription[] {
+  matchingBuildkite(organization: string, pipeline: string, event: BuildkiteEvent, branch: string, commit?: string): BuildkiteSubscription[] {
     return this.sqlite.query<BuildkiteSubscriptionRow, [string, string]>(`
       SELECT * FROM buildkite_subscriptions WHERE organization = ? AND pipeline = ?
     `).all(organization.toLowerCase(), pipeline.toLowerCase()).map(mapBuildkiteSubscription)
-      .filter((subscription) => subscription.events.includes(event))
+      .filter((subscription) => subscription.events.includes(event)
+        && (subscription.branch === undefined || subscription.branch === branch)
+        && (subscription.commit === undefined || subscription.commit === commit?.toLowerCase()))
   }
 
   deleteBuildkite(threadId: string, id: string, webhookUrl: string | null = null): boolean {

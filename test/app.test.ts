@@ -293,6 +293,80 @@ describe("subscription bridge", () => {
     expect(await listed.json()).toMatchObject({ subscriptions: [{ organization: "buildkite", pipeline: "amp-subscribe" }] })
   })
 
+  test("routes Buildkite events only to matching branch and commit scopes", async () => {
+    const app = bridge()
+    const commit = "a1".repeat(20)
+    for (const [threadID, filters] of [
+      ["T-all", {}],
+      ["T-branch", { branch: "Feature/CI" }],
+      ["T-commit", { commit: commit.toUpperCase() }],
+      ["T-both", { branch: "Feature/CI", commit }],
+    ] as const) {
+      const response = await app.fetch(buildkiteApiRequest({
+        organization: "buildkite", pipeline: "amp-subscribe",
+        webhookUrl: "https://hooks.example.test/buildkite", webhookBinding: "thread_v1",
+        events: ["build.finished"], behavior: "investigate", ...filters,
+      }, "POST", threadID))
+      expect(response.status).toBe(201)
+    }
+    const listed = await app.fetch(buildkiteApiRequest(undefined, "GET", "T-commit"))
+    expect(await listed.json()).toMatchObject({ subscriptions: [{ commit }] })
+    const targets: string[] = []
+    spyOn(globalThis, "fetch").mockImplementation((async (_input, init) => {
+      targets.push(JSON.parse(String(init?.body)).targetThreadID)
+      return new Response(null, { status: 202 })
+    }) as typeof fetch)
+    let number = 0
+    for (const [branch, buildCommit, expected] of [
+      ["Feature/CI", commit.toUpperCase(), ["T-all", "T-both", "T-branch", "T-commit"]],
+      ["main", commit, ["T-all", "T-commit"]],
+      ["feature/ci", commit, ["T-all", "T-commit"]],
+      ["Feature/CI", "b2".repeat(20), ["T-all", "T-branch"]],
+      ["Feature/CI", undefined, ["T-all", "T-branch"]],
+      ["main", "b2".repeat(20), ["T-all"]],
+    ] as const) {
+      number += 1
+      targets.length = 0
+      const body = JSON.stringify({
+        event: "build.finished",
+        pipeline: {
+          id: "849411f9-9e6d-4739-a0d8-e247088e9b52", slug: "amp-subscribe",
+          web_url: "https://buildkite.com/buildkite/amp-subscribe",
+        },
+        build: {
+          id: "f62a1b4d-10f9-4790-bc1c-e2c3a0c80983", number, state: "failed", blocked: false,
+          branch, commit: buildCommit, web_url: `https://buildkite.com/buildkite/amp-subscribe/builds/${number}`,
+          finished_at: "2026-10-05T05:00:00.000Z",
+        },
+      })
+      const response = await app.fetch(await buildkiteWebhookRequest(body))
+      expect(response.status).toBe(202)
+      expect(targets.sort()).toEqual([...expected])
+    }
+  })
+
+  test("rejects invalid Buildkite filters without broadening an existing subscription", async () => {
+    const app = bridge()
+    const input = {
+      organization: "buildkite", pipeline: "amp-subscribe", branch: "Feature/CI", commit: "a1".repeat(20),
+      webhookUrl: "https://hooks.example.test/buildkite", webhookBinding: "thread_v1",
+      events: ["build.finished"], behavior: "investigate",
+    }
+    expect((await app.fetch(buildkiteApiRequest(input))).status).toBe(201)
+    const before = app.database.listBuildkite("T-test")
+    for (const filters of [
+      { branch: "" }, { branch: null }, { branch: 1 }, { branch: "x".repeat(256) }, { branch: "main\n" },
+      { commit: "" }, { commit: null }, { commit: 1 }, { commit: "abc1234" },
+      { commit: "g".repeat(40) }, { commit: "a".repeat(41) },
+    ]) {
+      expect((await app.fetch(buildkiteApiRequest({ ...input, ...filters }))).status).toBe(400)
+      expect(app.database.listBuildkite("T-test")).toEqual(before)
+    }
+    const sha256 = await app.fetch(buildkiteApiRequest({ ...input, commit: "C3".repeat(32) }))
+    expect(sha256.status).toBe(201)
+    expect(await sha256.json()).toMatchObject({ subscription: { commit: "c3".repeat(32) } })
+  })
+
   test("rejects stale Buildkite signatures and subscriptions outside allowed organizations", async () => {
     const app = bridge()
     const registration = await app.fetch(buildkiteApiRequest({

@@ -134,6 +134,8 @@ async function subscribeToBuildkite(
   events: unknown[],
   behavior: string,
   deliveryMode?: DeliveryMode,
+  branch?: string,
+  commit?: string,
 ): Promise<{ id: string; deliveryMode: DeliveryMode }> {
   const response = await bridgeRequest(amp, "/api/buildkite-subscriptions", {
     method: "POST",
@@ -145,9 +147,17 @@ async function subscribeToBuildkite(
       events,
       behavior,
       ...(deliveryMode ? { deliveryMode } : {}),
+      ...(branch !== undefined ? { branch } : {}),
+      ...(commit !== undefined ? { commit } : {}),
     }),
   })
-  const result = await response.json() as { subscription: { id: string; deliveryMode?: DeliveryMode } }
+  const result = await response.json() as { subscription: { id: string; deliveryMode?: DeliveryMode; branch?: string; commit?: string } }
+  if (result.subscription.branch !== branch || result.subscription.commit !== commit?.toLowerCase()) {
+    await bridgeRequest(amp, "/api/buildkite-subscriptions", {
+      method: "DELETE", body: JSON.stringify({ id: result.subscription.id }),
+    })
+    throw new Error("The bridge did not retain the requested Buildkite filters. Removed the subscription; update the bridge before retrying.")
+  }
   return { id: result.subscription.id, deliveryMode: result.subscription.deliveryMode ?? "automatic" }
 }
 
@@ -1473,11 +1483,13 @@ export default async function ampSubscribe(amp: PluginAPI) {
   amp.registerTool({
     name: "buildkite_pipeline_subscribe",
     title: "Subscribe to Buildkite pipeline",
-    description: "Subscribe the current orb thread to build events from one Buildkite pipeline.",
+    description: "Subscribe the current orb thread to build events from one Buildkite pipeline. Without filters, watches all branches and commits. For CI after pushing, pass the full pushed commit SHA; update it after each push. Branch and commit filters must both match when supplied. Re-subscribing replaces the filters for this thread and pipeline; omitted filters are cleared.",
     inputSchema: {
       type: "object",
       properties: {
-        pipeline: { type: "string", description: "Buildkite organization/pipeline or pipeline URL" },
+        pipeline: { type: "string", description: "Buildkite organization/pipeline or pipeline URL. A build URL selects its pipeline, not that individual build." },
+        branch: { type: "string", description: "Exact branch name (case-sensitive); omit to watch all branches. No glob matching." },
+        commit: { type: "string", description: "Full 40- or 64-character hexadecimal commit SHA; omit to watch all commits. Use the pushed head SHA for post-push CI." },
         events: { type: "array", items: { type: "string", enum: buildkiteEvents }, description: "Build events to subscribe to; defaults to finished and skipped builds" },
         behavior: { type: "string", enum: ["notify", "investigate", "implement"], description: "What the thread should do; defaults to investigate" },
         deliveryMode: { type: "string", enum: deliveryModes, description: "How events enter active work: automatic (default) and steer use steering; queue opts out" },
@@ -1487,13 +1499,23 @@ export default async function ampSubscribe(amp: PluginAPI) {
     async execute(input, ctx) {
       if (typeof input.pipeline !== "string") throw new Error("Buildkite pipeline is required")
       const target = parseBuildkitePipeline(input.pipeline)
+      const branch = input.branch
+      const commit = input.commit
+      if (branch !== undefined && (typeof branch !== "string"
+        || !/^[^\u0000-\u001f\u007f\u2028\u2029]{1,255}$/.test(branch))) {
+        throw new Error("Provide a non-empty branch name of at most 255 characters without control characters")
+      }
+      if (commit !== undefined && (typeof commit !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit))) {
+        throw new Error("Provide a full 40- or 64-character hexadecimal commit SHA")
+      }
       const events = Array.isArray(input.events) ? input.events : defaultBuildkiteEvents
       const behavior = typeof input.behavior === "string" ? input.behavior : "investigate"
       const deliveryMode = enumValue(input.deliveryMode, deliveryModes)
       const subscription = await subscribeToBuildkite(
-        amp, webhookUrl, target.organization, target.pipeline, events, behavior, deliveryMode,
+        amp, webhookUrl, target.organization, target.pipeline, events, behavior, deliveryMode, branch, commit,
       )
-      return `Subscribed this thread to ${target.organization}/${target.pipeline} (${behavior}; ${subscription.deliveryMode} delivery; ${events.join(", ")}). Subscription ID: ${subscription.id}`
+      const scope = `${branch === undefined ? "all branches" : `branch ${JSON.stringify(branch)}`}; ${commit === undefined ? "all commits" : `commit ${commit.toLowerCase()}`}`
+      return `Subscribed this thread to ${target.organization}/${target.pipeline} (${scope}; ${behavior}; ${subscription.deliveryMode} delivery; ${events.join(", ")}). Subscription ID: ${subscription.id}`
     },
   })
 
