@@ -105,6 +105,14 @@ function validBuildkiteSlug(value: unknown): value is string {
   return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(value)
 }
 
+function validBuildkiteBranch(value: unknown): value is string {
+  return typeof value === "string" && /^[^\u0000-\u001f\u007f\u2028\u2029]{1,255}$/.test(value)
+}
+
+function validBuildkiteCommit(value: unknown): value is string {
+  return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value)
+}
+
 function validBehavior(value: unknown): value is SubscriptionBehavior {
   return value === "notify" || value === "investigate" || value === "implement"
 }
@@ -340,11 +348,10 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         return json({ error: "organization is not allowed" }, 400)
       }
       if (!validBuildkiteSlug(pipeline)) return json({ error: "invalid pipeline" }, 400)
-      if (branch !== undefined && (typeof branch !== "string"
-        || !/^[^\u0000-\u001f\u007f\u2028\u2029]{1,255}$/.test(branch))) {
+      if (branch !== undefined && !validBuildkiteBranch(branch)) {
         return json({ error: "invalid branch" }, 400)
       }
-      if (commit !== undefined && (typeof commit !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit))) {
+      if (commit !== undefined && !validBuildkiteCommit(commit)) {
         return json({ error: "commit must be a full 40- or 64-character hexadecimal SHA" }, 400)
       }
       if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
