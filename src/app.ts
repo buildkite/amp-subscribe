@@ -105,6 +105,14 @@ function validBuildkiteSlug(value: unknown): value is string {
   return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(value)
 }
 
+function validBuildkiteBranch(value: unknown): value is string {
+  return typeof value === "string" && /^[^\u0000-\u001f\u007f\u2028\u2029]{1,255}$/.test(value)
+}
+
+function validBuildkiteCommit(value: unknown): value is string {
+  return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value)
+}
+
 function validBehavior(value: unknown): value is SubscriptionBehavior {
   return value === "notify" || value === "investigate" || value === "implement"
 }
@@ -326,6 +334,8 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       const input = await request.json().catch(() => null) as Record<string, unknown> | null
       const organization = typeof input?.organization === "string" ? input.organization.toLowerCase() : ""
       const pipeline = typeof input?.pipeline === "string" ? input.pipeline.toLowerCase() : ""
+      const branch = input?.branch
+      const commit = input?.commit
       const webhookUrl = input?.webhookUrl
       const events = input?.events
       const behavior = input?.behavior
@@ -338,6 +348,12 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         return json({ error: "organization is not allowed" }, 400)
       }
       if (!validBuildkiteSlug(pipeline)) return json({ error: "invalid pipeline" }, 400)
+      if (branch !== undefined && !validBuildkiteBranch(branch)) {
+        return json({ error: "invalid branch" }, 400)
+      }
+      if (commit !== undefined && !validBuildkiteCommit(commit)) {
+        return json({ error: "commit must be a full 40- or 64-character hexadecimal SHA" }, 400)
+      }
       if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
         return json({ error: "webhookUrl host is not allowed" }, 400)
       }
@@ -350,6 +366,8 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         threadId: identity.threadId,
         organization,
         pipeline,
+        ...(branch !== undefined ? { branch } : {}),
+        ...(commit !== undefined ? { commit } : {}),
         webhookUrl,
         events,
         behavior,
@@ -401,7 +419,9 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     let failed = 0
     let removed = 0
     let deduplicated = 0
-    const subscriptions = database.matchingBuildkite(event.organization, event.pipeline.slug, event.event)
+    const subscriptions = database.matchingBuildkite(
+      event.organization, event.pipeline.slug, event.event, event.build.branch, event.build.commit,
+    )
     for (const subscription of subscriptions) {
       if (database.wasBuildkiteDelivered(subscription.id, deliveryId, event.event)) {
         deduplicated += 1

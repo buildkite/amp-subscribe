@@ -262,8 +262,8 @@ describe("SubscriptionDatabase", () => {
     expect(subscription).toMatchObject({
       organization: "buildkite", pipeline: "amp-subscribe", deliveryMode: "automatic", webhookBinding: "thread_v1",
     })
-    expect(database.matchingBuildkite("BUILDKITE", "AMP-SUBSCRIBE", "build.finished")).toEqual([subscription])
-    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.running")).toEqual([])
+    expect(database.matchingBuildkite("BUILDKITE", "AMP-SUBSCRIBE", "build.finished", "main")).toEqual([subscription])
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.running", "main")).toEqual([])
     database.markBuildkiteDelivered(subscription.id, "delivery-1", "build.finished")
     expect(database.wasBuildkiteDelivered(subscription.id, "delivery-1", "build.finished")).toBe(true)
 
@@ -281,6 +281,47 @@ describe("SubscriptionDatabase", () => {
     expect(database.countBuildkiteSubscriptions()).toBe(1)
     expect(database.deleteBuildkite("T-other", updated.id)).toBe(false)
     expect(database.deleteBuildkite("T-test", updated.id)).toBe(true)
+    database.close()
+  })
+
+  test("migrates Buildkite filters without losing subscriptions or deliveries and persists filter updates", () => {
+    const directory = mkdtempSync(join(tmpdir(), "amp-buildkite-filters-"))
+    directories.push(directory)
+    const path = join(directory, "relay.sqlite")
+    let database = new SubscriptionDatabase(path)
+    const input = {
+      threadId: "T-test", organization: "buildkite", pipeline: "amp-subscribe",
+      webhookUrl: "https://hooks.example.test/buildkite", events: ["build.finished"] as const,
+      behavior: "investigate" as const,
+    }
+    const subscription = database.upsertBuildkite({ ...input, events: [...input.events] }, "thread_v1")
+    database.markBuildkiteDelivered(subscription.id, "before-migration", "build.finished")
+    database.sqlite.exec("ALTER TABLE buildkite_subscriptions DROP COLUMN branch; ALTER TABLE buildkite_subscriptions DROP COLUMN commit_sha")
+    database.close()
+
+    database = new SubscriptionDatabase(path)
+    expect(database.listBuildkite("T-test")).toEqual([subscription])
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.finished", "other-branch")).toEqual([subscription])
+    const filtered = database.upsertBuildkite({
+      ...input, events: [...input.events], branch: "Feature/CI", commit: "A".repeat(40),
+    }, "thread_v1")
+    expect(filtered).toMatchObject({ id: subscription.id, branch: "Feature/CI", commit: "a".repeat(40) })
+    database.close()
+
+    database = new SubscriptionDatabase(path)
+    expect(database.listBuildkite("T-test")).toEqual([filtered])
+    expect(database.wasBuildkiteDelivered(subscription.id, "before-migration", "build.finished")).toBe(true)
+    const nextHead = database.upsertBuildkite({
+      ...input, events: [...input.events], branch: "Feature/CI", commit: "b".repeat(40),
+    }, "thread_v1")
+    expect(nextHead.id).toBe(subscription.id)
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.finished", "Feature/CI", "a".repeat(40))).toEqual([])
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.finished", "Feature/CI", "b".repeat(40))).toEqual([nextHead])
+    expect(database.countBuildkiteSubscriptions()).toBe(1)
+    const unfiltered = database.upsertBuildkite({ ...input, events: [...input.events] }, "thread_v1")
+    expect(unfiltered).toEqual(subscription)
+    expect(database.listBuildkite("T-test")).toEqual([unfiltered])
+    expect(database.matchingBuildkite("buildkite", "amp-subscribe", "build.finished", "any-branch")).toEqual([unfiltered])
     database.close()
   })
 })

@@ -30,6 +30,8 @@ export interface BuildkiteSubscription {
   threadId: string
   organization: string
   pipeline: string
+  branch?: string
+  commit?: string
   webhookUrl: string
   webhookBinding: WebhookBinding
   events: BuildkiteEvent[]
