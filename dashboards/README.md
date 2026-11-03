@@ -30,20 +30,24 @@ it in place rather than creating a duplicate.
 
 ## Webhook migration
 
-After deploying the per-thread webhook bridge, add a Stat panel for **Legacy subscriptions remaining**:
+The exported dashboard covers Buildkite webhooks, RSS/Atom polling, API traffic, subscription counts,
+and current webhook bindings. GitHub-only panels and queries have been removed. Importing the JSON
+updates the dashboard definition; this repository change does not update live Grafana automatically.
+
+For a separate Stat panel showing **Legacy subscriptions remaining**, use:
 
 ```promql
 sum by (app) (amp_subscribe_webhook_bindings{app=~"$app",binding="legacy"})
 ```
 
-For a time series showing both versions and GitHub/Buildkite/feed sources:
+For a time series showing both versions and Buildkite/feed sources:
 
 ```promql
 sum by (app, source, binding) (amp_subscribe_webhook_bindings{app=~"$app"})
 ```
 
-Use the existing `$app` variable and `Prometheus on Fly` datasource. These queries are ready to add;
-the exported dashboard JSON and live Grafana dashboard are not changed by this documentation.
+Use the existing `$app` variable and `Prometheus on Fly` datasource. The exported **Current webhook
+bindings** panel shows the same source/version breakdown as an instant bar gauge.
 Keep “No data” distinct from zero and verify fresh, healthy scrapes. The gauge is rebuilt from the
 database on every scrape, with explicit zeroes for every source/version pair and no per-thread or
 URL labels.

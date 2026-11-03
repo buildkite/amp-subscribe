@@ -18,10 +18,6 @@ bun test
 bun run typecheck
 '''
 
-[tasks.setup-github-app]
-description = "Create and configure a GitHub App using the manifest flow"
-run = "bun scripts/setup-github-app.ts"
-
 [tasks.deploy]
 description = "Deploy the app to Fly.io"
 run = "flyctl deploy --remote-only"
