@@ -3,27 +3,20 @@ import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { OrbIdentity } from "./auth"
 import { normalizeBuildkiteEvent, verifyBuildkiteSignature } from "./buildkite"
-import { verifyHmac } from "./crypto"
 import { SubscriptionDatabase } from "./database"
-import { normalizeGitHubEvent } from "./events"
 import { fetchFeed, type FetchedFeed } from "./feeds"
 import { MetricsRegistry } from "./metrics"
 import {
   buildkiteEvents,
-  subscriptionEvents,
   type BuildkiteEvent,
   type BuildkiteSubscription,
-  type RoutedEvent,
-  type Subscription,
   type SubscriptionBehavior,
   type SubscriptionDeliveryMode,
-  type SubscriptionEvent,
   type WebhookBinding,
 } from "./types"
 
 export interface SubscriptionBridgeConfig {
   databasePath: string
-  githubWebhookSecret: string
   buildkiteWebhookSecret: string
   buildkiteAllowedOrganizations: string[]
   allowedWebhookHosts: string[]
@@ -32,31 +25,12 @@ export interface SubscriptionBridgeConfig {
   fetchFeed?: (url: string, conditional?: { etag?: string | null; lastModified?: string | null }) => Promise<FetchedFeed>
 }
 
-function relaySuppressionReason(event: RoutedEvent): string | null {
-  if (event.githubEvent === "pull_request" && event.action === "edited"
-    && event.detail?.kind === "pull_request" && event.detail.changedFields?.length
-    && event.detail.changedFields.every((field) => field === "body" || field === "title")) {
-    return "pull_request_edit"
-  }
-  const detail = event.detail
-  const checkEvent = event.githubEvent === "check_run" || event.githubEvent === "check_suite"
-    || event.githubEvent === "workflow_run"
-  if (!checkEvent) return null
-  if (!detail || (detail.kind !== "check_run" && detail.kind !== "check_suite" && detail.kind !== "workflow_run")) {
-    return "check_lifecycle"
-  }
-  if (detail.kind !== event.githubEvent) {
-    return "check_lifecycle"
-  }
-  return detail.status === "completed" && detail.conclusion ? null : "check_lifecycle"
-}
-
 function json(value: unknown, status = 200): Response {
   return Response.json(value, { status })
 }
 
 function logWebhookOutcome(
-  subscription: Pick<Subscription | BuildkiteSubscription, "id" | "threadId" | "createdAt" | "webhookUrl" | "webhookBinding">,
+  subscription: Pick<BuildkiteSubscription, "id" | "threadId" | "createdAt" | "webhookUrl" | "webhookBinding">,
   response: Response | null,
   details: Record<string, unknown>,
 ): void {
@@ -87,12 +61,6 @@ function isAllowedWebhookUrl(value: string, allowedHosts: string[]): boolean {
   } catch {
     return false
   }
-}
-
-function validEvents(value: unknown): value is SubscriptionEvent[] {
-  return Array.isArray(value) && value.length > 0 && value.every((event) =>
-    typeof event === "string" && subscriptionEvents.includes(event as SubscriptionEvent),
-  )
 }
 
 function validBuildkiteEvents(value: unknown): value is BuildkiteEvent[] {
@@ -131,26 +99,12 @@ function rejectLegacyWebhook(threadId: string): Response {
   return json({ error: "Legacy webhooks are disabled; update and reload the subscribe plugin" }, 409)
 }
 
-function validBranch(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 255
-    && /^[!-~]+$/.test(value)
-    && value !== "@" && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".")
-    && !value.includes("..") && !value.includes("//") && !value.includes("@{")
-    && !/[\u0000-\u0020\u007f~^:?*\\[]/.test(value)
-    && value.split("/").every((part) => !part.startsWith(".") && !part.endsWith(".lock"))
-}
-
 export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
   if (config.databasePath !== ":memory:") mkdirSync(dirname(config.databasePath), { recursive: true })
   const database = new SubscriptionDatabase(config.databasePath)
   const feedFetcher = config.fetchFeed ?? fetchFeed
 
   const metrics = new MetricsRegistry()
-  const subscriptionTargetTypes = ["pull_request", "branch", "repository"] as const
-  const subscriptionsGauge = metrics.gauge(
-    "amp_subscribe_subscriptions",
-    "Current number of GitHub subscriptions, by target type.",
-  )
   const feedSubscriptionsGauge = metrics.gauge(
     "amp_subscribe_feed_subscriptions",
     "Current number of feed subscriptions.",
@@ -166,22 +120,6 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
   const webhookBindingsGauge = metrics.gauge(
     "amp_subscribe_webhook_bindings",
     "Current subscriptions by source and webhook binding version, not successful migrations.",
-  )
-  const webhookEventsReceivedTotal = metrics.counter(
-    "amp_subscribe_webhook_events_received_total",
-    "GitHub webhook deliveries received with a valid signature, by GitHub event type.",
-  )
-  const webhookSignatureFailuresTotal = metrics.counter(
-    "amp_subscribe_webhook_signature_failures_total",
-    "GitHub webhook deliveries rejected for an invalid HMAC signature.",
-  )
-  const webhookEventsSuppressedTotal = metrics.counter(
-    "amp_subscribe_webhook_events_suppressed_total",
-    "Normalized GitHub events suppressed before matching subscriptions, by reason.",
-  )
-  const webhookDeliveriesTotal = metrics.counter(
-    "amp_subscribe_webhook_deliveries_total",
-    "Attempts to forward a matched GitHub event to an Amp durable webhook, by outcome.",
   )
   const feedPollTotal = metrics.counter(
     "amp_subscribe_feed_poll_total",
@@ -199,109 +137,20 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
     "amp_subscribe_buildkite_webhook_deliveries_total",
     "Attempts to forward a matched Buildkite event to an Amp durable webhook, by outcome.",
   )
-  for (const outcome of ["delivered", "failed", "removed"]) webhookDeliveriesTotal.inc({ outcome }, 0)
   for (const outcome of ["delivered", "failed", "removed"]) buildkiteWebhookDeliveriesTotal.inc({ outcome }, 0)
   for (const result of ["checked", "delivered", "failed", "removed"]) feedPollTotal.inc({ result }, 0)
-  webhookSignatureFailuresTotal.inc({}, 0)
   buildkiteWebhookSignatureFailuresTotal.inc({}, 0)
 
   function refreshGauges(): void {
-    const counts = new Map(database.countSubscriptionsByTargetType().map((row) => [row.targetType, row.count]))
-    for (const targetType of subscriptionTargetTypes) {
-      subscriptionsGauge.set({ target_type: targetType }, counts.get(targetType) ?? 0)
-    }
     feedSubscriptionsGauge.set({}, database.countFeedSubscriptions())
     buildkiteSubscriptionsGauge.set({}, database.countBuildkiteSubscriptions())
     const bindings = database.countWebhookBindings()
-    for (const source of ["github", "feed", "buildkite"]) {
+    for (const source of ["feed", "buildkite"]) {
       for (const binding of ["legacy", "thread_v1"]) {
         webhookBindingsGauge.set({ source, binding },
           bindings.find((row) => row.source === source && row.binding === binding)?.count ?? 0)
       }
     }
-  }
-
-  async function subscriptions(request: Request): Promise<Response> {
-    const identity = await config.authenticate(request).catch(() => null)
-    if (!identity) return json({ error: "unauthorized" }, 401)
-
-    if (request.method === "GET") {
-      return json({ subscriptions: database.list(identity.threadId).map(({ webhookUrl: _, ...item }) => item) })
-    }
-
-    if (request.method === "POST") {
-      const input = await request.json().catch(() => null) as Record<string, unknown> | null
-      const repository = typeof input?.repository === "string" ? input.repository.toLowerCase() : ""
-      const targetType = input?.targetType ?? (input?.pullRequestNumber === undefined ? undefined : "pull_request")
-      const pullRequestNumber = input?.pullRequestNumber
-      const branch = input?.branch
-      const webhookUrl = input?.webhookUrl
-      const events = input?.events
-      const behavior = input?.behavior
-      const deliveryMode = input?.deliveryMode
-      const webhookBinding = parseWebhookBinding(input?.webhookBinding)
-      if (!webhookBinding) return json({ error: "invalid webhookBinding" }, 400)
-      if (webhookBinding === "legacy" && config.allowLegacyWebhooks === false) return rejectLegacyWebhook(identity.threadId)
-      if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) return json({ error: "invalid repository" }, 400)
-      if (targetType !== "pull_request" && targetType !== "branch" && targetType !== "repository") {
-        return json({ error: "invalid targetType" }, 400)
-      }
-      if (targetType === "pull_request" && (!Number.isInteger(pullRequestNumber) || (pullRequestNumber as number) < 1)) {
-        return json({ error: "invalid pullRequestNumber" }, 400)
-      }
-      if (targetType === "branch" && !validBranch(branch)) {
-        return json({ error: "invalid branch" }, 400)
-      }
-      if (typeof webhookUrl !== "string" || !isAllowedWebhookUrl(webhookUrl, config.allowedWebhookHosts)) {
-        return json({ error: "webhookUrl host is not allowed" }, 400)
-      }
-      if (!validEvents(events)) return json({ error: "invalid events" }, 400)
-      if (targetType === "pull_request" && events.includes("issues")) {
-        return json({ error: "pull request subscriptions do not support issues" }, 400)
-      }
-      if (targetType === "branch" && events.some((event) => event !== "commits" && event !== "checks")) {
-        return json({ error: "branch subscriptions support only commits and checks" }, 400)
-      }
-      if (targetType === "repository" && events.some((event) => event !== "pull_requests" && event !== "issues")) {
-        return json({ error: "repository subscriptions support only pull_requests and issues" }, 400)
-      }
-      if (!validBehavior(behavior)) return json({ error: "invalid behavior" }, 400)
-      if (deliveryMode !== undefined && !validDeliveryMode(deliveryMode)) {
-        return json({ error: "invalid deliveryMode" }, 400)
-      }
-      const common = {
-        threadId: identity.threadId,
-        repository,
-        webhookUrl,
-        events,
-        behavior,
-        deliveryMode,
-      }
-      const subscription = targetType === "pull_request"
-        ? database.upsert({ ...common, targetType, pullRequestNumber: pullRequestNumber as number }, webhookBinding)
-        : targetType === "branch"
-          ? database.upsert({ ...common, targetType, branch: branch as string }, webhookBinding)
-          : database.upsert({ ...common, targetType }, webhookBinding)
-      console.info(JSON.stringify({ event: "subscription_registered", source: "github", threadId: identity.threadId,
-        subscriptionId: subscription.id, webhookBinding, timestamp: new Date().toISOString() }))
-      const { webhookUrl: _, ...safeSubscription } = subscription
-      return json({ subscription: safeSubscription }, 201)
-    }
-
-    if (request.method === "DELETE") {
-      const input = await request.json().catch(() => null) as Record<string, unknown> | null
-      if (typeof input?.id !== "string") {
-        return json({ error: "id is required" }, 400)
-      }
-      const deleted = database.delete(identity.threadId, input.id)
-      if (deleted) console.info(JSON.stringify({ event: "subscription_unsubscribed", source: "github",
-        threadId: identity.threadId, subscriptionId: input.id, timestamp: new Date().toISOString() }))
-      return deleted
-        ? new Response(null, { status: 204 })
-        : json({ error: "subscription not found" }, 404)
-    }
-
-    return json({ error: "method not allowed" }, 405)
   }
 
   async function updateWebhook(request: Request): Promise<Response> {
@@ -474,119 +323,6 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
       deduplicated, delivered, failed, removed, timestamp: new Date().toISOString() }))
     if (failed > 0) return json({ error: "Amp webhook delivery failed", failed, delivered, removed }, 502)
     return json({ accepted: true, matchedEvents: 1, delivered, removed }, 202)
-  }
-
-  async function githubWebhook(request: Request): Promise<Response> {
-    const body = new Uint8Array(await request.arrayBuffer())
-    const signature = request.headers.get("x-hub-signature-256") ?? ""
-    if (!await verifyHmac(config.githubWebhookSecret, body, signature)) {
-      webhookSignatureFailuresTotal.inc()
-      return json({ error: "invalid signature" }, 401)
-    }
-    const eventName = request.headers.get("x-github-event") ?? ""
-    const deliveryId = request.headers.get("x-github-delivery") ?? ""
-    webhookEventsReceivedTotal.inc({ event: eventName || "unknown" })
-    let payload: unknown
-    try {
-      payload = JSON.parse(new TextDecoder().decode(body)) as unknown
-    } catch {
-      return json({ error: "invalid JSON" }, 400)
-    }
-    const normalizedEvents = normalizeGitHubEvent(eventName, deliveryId, payload)
-    const events: RoutedEvent[] = []
-    for (const event of normalizedEvents) {
-      const reason = relaySuppressionReason(event)
-      if (reason) webhookEventsSuppressedTotal.inc({ reason })
-      else events.push(event)
-    }
-    const suppressed = normalizedEvents.length - events.length
-    let delivered = 0
-    let failed = 0
-    let removed = 0
-    let matchedSubscriptions = 0
-    let deduplicated = 0
-
-    for (const event of events) {
-      const target = event.targetType === "pull_request"
-        ? String(event.pullRequest.number)
-        : event.targetType === "branch" ? event.branch.name : "*"
-      const idempotencyKey = event.targetType === "pull_request"
-        ? `${deliveryId}:${event.event}:${event.repository.id}:${target}`
-        : event.targetType === "branch"
-          ? `${deliveryId}:${event.event}:${event.repository.id}:branch:${encodeURIComponent(target)}`
-          : `${deliveryId}:${event.event}:${event.repository.id}:repository`
-      for (const subscription of database.matching(
-        event.repository.fullName,
-        event.targetType,
-        target,
-        event.event,
-      )) {
-        matchedSubscriptions += 1
-        if (database.wasDelivered(subscription.id, deliveryId, event.event)) {
-          deduplicated += 1
-          continue
-        }
-        const deliveryLog = {
-          source: "github", repository: subscription.repository, targetType: subscription.targetType,
-          target, deliveryId, githubEvent: event.githubEvent, subscriptionEvent: event.event, action: event.action,
-          idempotencyKey: `${idempotencyKey}:${subscription.id}`,
-        }
-        const forwardedBody = JSON.stringify({
-          ...event,
-          behavior: subscription.behavior,
-          deliveryMode: subscription.deliveryMode,
-          targetThreadID: subscription.threadId,
-        })
-        let response: Response
-        try {
-          response = await fetch(subscription.webhookUrl, {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "idempotency-key": `${idempotencyKey}:${subscription.id}`,
-            },
-            body: forwardedBody,
-            signal: AbortSignal.timeout(10_000),
-          })
-        } catch {
-          failed += 1
-          webhookDeliveriesTotal.inc({ outcome: "failed" })
-          logWebhookOutcome(subscription, null, { ...deliveryLog, event: "webhook_delivery_failed", reason: "transport_error" })
-          continue
-        }
-        if (response.status === 404 || response.status === 410) {
-          // A late response from the shared endpoint must not delete a migrated subscription.
-          if (!database.delete(subscription.threadId, subscription.id, subscription.webhookUrl)) {
-            failed += 1
-            webhookDeliveriesTotal.inc({ outcome: "failed" })
-            logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "subscription_changed_or_deleted" })
-            continue
-          }
-          removed += 1
-          webhookDeliveriesTotal.inc({ outcome: "removed" })
-          logWebhookOutcome(subscription, response, {
-            ...deliveryLog, event: "subscription_removed", reason: "webhook_not_found_or_gone",
-          })
-          continue
-        }
-        if (!response.ok) {
-          failed += 1
-          webhookDeliveriesTotal.inc({ outcome: "failed" })
-          logWebhookOutcome(subscription, response, { ...deliveryLog, event: "webhook_delivery_failed", reason: "http_error" })
-          continue
-        }
-        database.markDelivered(subscription.id, deliveryId, event.event)
-        delivered += 1
-        webhookDeliveriesTotal.inc({ outcome: "delivered" })
-      }
-    }
-    console.info(JSON.stringify({ event: "github_webhook_processed", deliveryId, githubEvent: eventName,
-      matchedEvents: events.length, matchedSubscriptions, deduplicated, delivered, failed, removed, suppressed,
-      timestamp: new Date().toISOString() }))
-    if (failed > 0) {
-      return json({ error: "Amp webhook delivery failed", failed, delivered, removed, suppressed }, 502)
-    }
-    return json({ accepted: true, matchedEvents: events.length, delivered, removed, suppressed }, 202)
   }
 
   async function feedSubscriptions(request: Request): Promise<Response> {
@@ -765,11 +501,6 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         apiRequestsTotal.inc({ route: "webhook", method: request.method, status: String(response.status) })
         return response
       }
-      if (url.pathname === "/api/subscriptions") {
-        const response = await subscriptions(request)
-        apiRequestsTotal.inc({ route: "subscriptions", method: request.method, status: String(response.status) })
-        return response
-      }
       if (url.pathname === "/api/feed-subscriptions") {
         const response = await feedSubscriptions(request)
         apiRequestsTotal.inc({
@@ -784,7 +515,6 @@ export function createSubscriptionBridge(config: SubscriptionBridgeConfig) {
         apiRequestsTotal.inc({ route: "buildkite-subscriptions", method: request.method, status: String(response.status) })
         return response
       }
-      if (request.method === "POST" && url.pathname === "/github/webhook") return githubWebhook(request)
       if (request.method === "POST" && url.pathname === "/buildkite/webhook") return buildkiteWebhook(request)
       return json({ error: "not found" }, 404)
     },

@@ -4,10 +4,8 @@ import type {
   BuildkiteSubscription,
   FeedEntry,
   FeedSubscription,
-  Subscription,
   SubscriptionBehavior,
   SubscriptionDeliveryMode,
-  SubscriptionEvent,
   WebhookBinding,
 } from "./types"
 
@@ -15,23 +13,7 @@ type WithoutStoredFields<T> = T extends unknown ? Omit<T, "id" | "createdAt" | "
 type WithOptionalDeliveryMode<T> = T extends unknown
   ? Omit<T, "deliveryMode"> & { deliveryMode?: SubscriptionDeliveryMode }
   : never
-type SubscriptionInput = WithOptionalDeliveryMode<WithoutStoredFields<Subscription>>
 type BuildkiteSubscriptionInput = WithOptionalDeliveryMode<WithoutStoredFields<BuildkiteSubscription>>
-
-interface SubscriptionRow {
-  id: string
-  thread_id: string
-  repository: string
-  pull_request_number: number | null
-  target_type: "pull_request" | "branch" | "repository" | null
-  target: string | null
-  webhook_url: string
-  webhook_binding: WebhookBinding
-  events: string
-  behavior: SubscriptionBehavior
-  delivery_mode: SubscriptionDeliveryMode
-  created_at: string
-}
 
 interface FeedSubscriptionRow {
   id: string
@@ -74,25 +56,6 @@ function mapFeedSubscription(row: FeedSubscriptionRow): FeedSubscription {
   }
 }
 
-function mapSubscription(row: SubscriptionRow): Subscription {
-  const common = {
-    id: row.id,
-    threadId: row.thread_id,
-    repository: row.repository,
-    webhookUrl: row.webhook_url,
-    webhookBinding: row.webhook_binding,
-    events: JSON.parse(row.events) as SubscriptionEvent[],
-    behavior: row.behavior,
-    deliveryMode: row.delivery_mode,
-    createdAt: row.created_at,
-  }
-  if (row.target_type === "branch" && row.target) {
-    return { ...common, targetType: "branch", branch: row.target }
-  }
-  if (row.target_type === "repository") return { ...common, targetType: "repository" }
-  return { ...common, targetType: "pull_request", pullRequestNumber: row.pull_request_number ?? Number(row.target) }
-}
-
 function mapBuildkiteSubscription(row: BuildkiteSubscriptionRow): BuildkiteSubscription {
   return {
     id: row.id,
@@ -117,39 +80,8 @@ export class SubscriptionDatabase {
     this.sqlite = new Database(path, { create: true })
     this.sqlite.exec("PRAGMA journal_mode = WAL")
     this.sqlite.exec("PRAGMA foreign_keys = ON")
-    const columns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(subscriptions)").all()
-    const legacy = columns.some((column) => column.name === "pull_request_number")
-      && !columns.some((column) => column.name === "target_type")
-    if (legacy) this.migratePullRequestSubscriptions()
-    const schema = this.sqlite.query<{ sql: string }, []>(`
-      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'
-    `).get()?.sql
-    if (schema && !schema.includes("'repository'")) this.migrateRepositorySubscriptions()
+    // Obsolete GitHub tables, if present, are intentionally left untouched.
     this.sqlite.exec(`
-      CREATE TABLE IF NOT EXISTS subscriptions (
-        id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        pull_request_number INTEGER,
-        target_type TEXT CHECK(target_type IN ('pull_request', 'branch', 'repository')),
-        target TEXT,
-        webhook_url TEXT NOT NULL,
-        events TEXT NOT NULL,
-        behavior TEXT NOT NULL,
-        delivery_mode TEXT NOT NULL DEFAULT 'automatic'
-          CHECK(delivery_mode IN ('automatic', 'queue', 'steer')),
-        created_at TEXT NOT NULL,
-        UNIQUE(thread_id, repository, target_type, target),
-        UNIQUE(thread_id, repository, pull_request_number)
-      );
-      CREATE TABLE IF NOT EXISTS deliveries (
-        subscription_id TEXT NOT NULL,
-        delivery_id TEXT NOT NULL,
-        event TEXT NOT NULL,
-        delivered_at TEXT NOT NULL,
-        PRIMARY KEY(subscription_id, delivery_id, event),
-        FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-      );
       CREATE TABLE IF NOT EXISTS feed_subscriptions (
         id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
@@ -196,17 +128,10 @@ export class SubscriptionDatabase {
       );
     `)
     // Existing endpoints are unclassified until an updated plugin registers them.
-    for (const table of ["subscriptions", "feed_subscriptions"]) {
-      const columns = this.sqlite.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all()
-      if (!columns.some((column) => column.name === "webhook_binding")) {
-        this.sqlite.exec(`ALTER TABLE ${table} ADD COLUMN webhook_binding TEXT NOT NULL
-          DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1'))`)
-      }
-    }
-    const subscriptionColumns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(subscriptions)").all()
-    if (!subscriptionColumns.some((column) => column.name === "delivery_mode")) {
-      this.sqlite.exec(`ALTER TABLE subscriptions ADD COLUMN delivery_mode TEXT NOT NULL
-        DEFAULT 'automatic' CHECK(delivery_mode IN ('automatic', 'queue', 'steer'))`)
+    const feedColumns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(feed_subscriptions)").all()
+    if (!feedColumns.some((column) => column.name === "webhook_binding")) {
+      this.sqlite.exec(`ALTER TABLE feed_subscriptions ADD COLUMN webhook_binding TEXT NOT NULL
+        DEFAULT 'legacy' CHECK(webhook_binding IN ('legacy', 'thread_v1'))`)
     }
     const buildkiteColumns = this.sqlite.query<{ name: string }, []>("PRAGMA table_info(buildkite_subscriptions)").all()
     for (const column of ["branch", "commit_sha"]) {
@@ -214,154 +139,6 @@ export class SubscriptionDatabase {
         this.sqlite.exec(`ALTER TABLE buildkite_subscriptions ADD COLUMN ${column} TEXT`)
       }
     }
-  }
-
-  private migratePullRequestSubscriptions(): void {
-    this.sqlite.exec("PRAGMA foreign_keys = OFF")
-    this.sqlite.transaction(() => {
-      this.sqlite.exec(`
-        ALTER TABLE deliveries RENAME TO deliveries_legacy;
-        ALTER TABLE subscriptions RENAME TO subscriptions_legacy;
-        CREATE TABLE subscriptions (
-          id TEXT PRIMARY KEY,
-          thread_id TEXT NOT NULL,
-          repository TEXT NOT NULL,
-          pull_request_number INTEGER,
-          target_type TEXT CHECK(target_type IN ('pull_request', 'branch', 'repository')),
-          target TEXT,
-          webhook_url TEXT NOT NULL,
-          events TEXT NOT NULL,
-          behavior TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          UNIQUE(thread_id, repository, target_type, target),
-          UNIQUE(thread_id, repository, pull_request_number)
-        );
-        CREATE TABLE deliveries (
-          subscription_id TEXT NOT NULL,
-          delivery_id TEXT NOT NULL,
-          event TEXT NOT NULL,
-          delivered_at TEXT NOT NULL,
-          PRIMARY KEY(subscription_id, delivery_id, event),
-          FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-        );
-        INSERT INTO subscriptions
-          (id, thread_id, repository, pull_request_number, target_type, target,
-            webhook_url, events, behavior, created_at)
-        SELECT id, thread_id, repository, pull_request_number, 'pull_request', CAST(pull_request_number AS TEXT),
-          webhook_url, events, behavior, created_at
-        FROM subscriptions_legacy;
-        INSERT INTO deliveries SELECT * FROM deliveries_legacy;
-        DROP TABLE deliveries_legacy;
-        DROP TABLE subscriptions_legacy;
-      `)
-    })()
-    this.sqlite.exec("PRAGMA foreign_keys = ON")
-  }
-
-  private migrateRepositorySubscriptions(): void {
-    this.sqlite.exec("PRAGMA foreign_keys = OFF")
-    this.sqlite.transaction(() => {
-      this.sqlite.exec(`
-        ALTER TABLE deliveries RENAME TO deliveries_before_repository_targets;
-        ALTER TABLE subscriptions RENAME TO subscriptions_before_repository_targets;
-        CREATE TABLE subscriptions (
-          id TEXT PRIMARY KEY,
-          thread_id TEXT NOT NULL,
-          repository TEXT NOT NULL,
-          pull_request_number INTEGER,
-          target_type TEXT CHECK(target_type IN ('pull_request', 'branch', 'repository')),
-          target TEXT,
-          webhook_url TEXT NOT NULL,
-          events TEXT NOT NULL,
-          behavior TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          UNIQUE(thread_id, repository, target_type, target),
-          UNIQUE(thread_id, repository, pull_request_number)
-        );
-        CREATE TABLE deliveries (
-          subscription_id TEXT NOT NULL,
-          delivery_id TEXT NOT NULL,
-          event TEXT NOT NULL,
-          delivered_at TEXT NOT NULL,
-          PRIMARY KEY(subscription_id, delivery_id, event),
-          FOREIGN KEY(subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-        );
-        INSERT INTO subscriptions SELECT * FROM subscriptions_before_repository_targets;
-        INSERT INTO deliveries SELECT * FROM deliveries_before_repository_targets;
-        DROP TABLE deliveries_before_repository_targets;
-        DROP TABLE subscriptions_before_repository_targets;
-      `)
-    })()
-    this.sqlite.exec("PRAGMA foreign_keys = ON")
-  }
-
-  upsert(input: SubscriptionInput, webhookBinding: WebhookBinding = "legacy"): Subscription {
-    const target = input.targetType === "pull_request" ? String(input.pullRequestNumber)
-      : input.targetType === "branch" ? input.branch
-        : "*"
-    const pullRequestNumber = input.targetType === "pull_request" ? input.pullRequestNumber : null
-    const existing = this.sqlite.query<SubscriptionRow, [string, string, string, string, string, string]>(`
-      SELECT * FROM subscriptions
-      WHERE thread_id = ? AND repository = ?
-        AND ((target_type = ? AND target = ?)
-          OR (? = 'pull_request' AND target_type IS NULL AND pull_request_number = CAST(? AS INTEGER)))
-    `).get(input.threadId, input.repository, input.targetType, target, input.targetType, target)
-    const stored = {
-      id: existing?.id ?? crypto.randomUUID(),
-      createdAt: existing?.created_at ?? new Date().toISOString(),
-    }
-    const subscription: Subscription = {
-      ...input,
-      deliveryMode: input.deliveryMode ?? existing?.delivery_mode ?? "automatic",
-      ...stored,
-      webhookBinding,
-    }
-    if (existing) {
-      this.sqlite.query(`
-        UPDATE subscriptions SET
-          target_type = ?, target = ?, pull_request_number = ?, webhook_url = ?, events = ?, behavior = ?,
-          delivery_mode = ?, webhook_binding = ?
-        WHERE id = ?
-      `).run(
-        subscription.targetType,
-        target,
-        pullRequestNumber,
-        subscription.webhookUrl,
-        JSON.stringify(subscription.events),
-        subscription.behavior,
-        subscription.deliveryMode,
-        webhookBinding,
-        subscription.id,
-      )
-    } else {
-      this.sqlite.query(`
-        INSERT INTO subscriptions
-          (id, thread_id, repository, pull_request_number, target_type, target,
-            webhook_url, events, behavior, delivery_mode, created_at, webhook_binding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        subscription.id,
-        subscription.threadId,
-        subscription.repository,
-        pullRequestNumber,
-        subscription.targetType,
-        target,
-        subscription.webhookUrl,
-        JSON.stringify(subscription.events),
-        subscription.behavior,
-        subscription.deliveryMode,
-        subscription.createdAt,
-        webhookBinding,
-      )
-    }
-    return subscription
-  }
-
-  countSubscriptionsByTargetType(): Array<{ targetType: string; count: number }> {
-    return this.sqlite.query<{ target_type: string; count: number }, []>(`
-      SELECT COALESCE(target_type, 'pull_request') AS target_type, COUNT(*) AS count
-      FROM subscriptions GROUP BY COALESCE(target_type, 'pull_request')
-    `).all().map((row) => ({ targetType: row.target_type, count: row.count }))
   }
 
   countFeedSubscriptions(): number {
@@ -376,64 +153,25 @@ export class SubscriptionDatabase {
     ).get()?.count ?? 0
   }
 
-  list(threadId: string): Subscription[] {
-    return this.sqlite.query<SubscriptionRow, [string]>(
-      "SELECT * FROM subscriptions WHERE thread_id = ? ORDER BY created_at",
-    ).all(threadId).map(mapSubscription)
-  }
-
   updateWebhook(threadId: string, webhookUrl: string, webhookBinding: WebhookBinding = "legacy") {
     return this.sqlite.transaction(() => {
-      const github = this.sqlite.query(`UPDATE subscriptions SET webhook_url = ?, webhook_binding = ?
-        WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
-        .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
       const feed = this.sqlite.query(`UPDATE feed_subscriptions SET webhook_url = ?, webhook_binding = ?
         WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
         .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
       const buildkite = this.sqlite.query(`UPDATE buildkite_subscriptions SET webhook_url = ?, webhook_binding = ?
         WHERE thread_id = ? AND (webhook_url != ? OR webhook_binding != ?)`)
         .run(webhookUrl, webhookBinding, threadId, webhookUrl, webhookBinding).changes
-      return { github, feed, buildkite }
+      return { feed, buildkite }
     })()
   }
 
   countWebhookBindings() {
     return this.sqlite.query<{ source: string; binding: WebhookBinding; count: number }, []>(`
-      SELECT 'github' AS source, webhook_binding AS binding, COUNT(*) AS count
-      FROM subscriptions GROUP BY webhook_binding
-      UNION ALL
-      SELECT 'feed', webhook_binding, COUNT(*) FROM feed_subscriptions GROUP BY webhook_binding
+      SELECT 'feed' AS source, webhook_binding AS binding, COUNT(*) AS count
+      FROM feed_subscriptions GROUP BY webhook_binding
       UNION ALL
       SELECT 'buildkite', webhook_binding, COUNT(*) FROM buildkite_subscriptions GROUP BY webhook_binding
     `).all()
-  }
-
-  matching(repository: string, targetType: Subscription["targetType"], target: string, event: SubscriptionEvent): Subscription[] {
-    return this.sqlite.query<SubscriptionRow, [string, string, string, string, string]>(`
-      SELECT * FROM subscriptions WHERE repository = ?
-        AND ((target_type = ? AND target = ?)
-          OR (? = 'pull_request' AND target_type IS NULL AND pull_request_number = CAST(? AS INTEGER)))
-    `).all(repository.toLowerCase(), targetType, target, targetType, target).map(mapSubscription)
-      .filter((subscription) => subscription.events.includes(event))
-  }
-
-  delete(threadId: string, id: string, webhookUrl: string | null = null): boolean {
-    return this.sqlite.query(`
-      DELETE FROM subscriptions WHERE id = ? AND thread_id = ? AND (? IS NULL OR webhook_url = ?)
-    `).run(id, threadId, webhookUrl, webhookUrl).changes > 0
-  }
-
-  wasDelivered(subscriptionId: string, deliveryId: string, event: string): boolean {
-    return this.sqlite.query(`
-      SELECT 1 FROM deliveries WHERE subscription_id = ? AND delivery_id = ? AND event = ?
-    `).get(subscriptionId, deliveryId, event) !== null
-  }
-
-  markDelivered(subscriptionId: string, deliveryId: string, event: string): void {
-    this.sqlite.query(`
-      INSERT OR IGNORE INTO deliveries (subscription_id, delivery_id, event, delivered_at)
-      VALUES (?, ?, ?, ?)
-    `).run(subscriptionId, deliveryId, event, new Date().toISOString())
   }
 
   upsertBuildkite(

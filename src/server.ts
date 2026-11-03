@@ -20,7 +20,6 @@ if (allowLegacyWebhooks !== "true" && allowLegacyWebhooks !== "false") {
 const bridge = createSubscriptionBridge({
   databasePath: process.env.DATABASE_PATH ?? "./data/relay.sqlite",
   allowLegacyWebhooks: allowLegacyWebhooks === "true",
-  githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
   buildkiteWebhookSecret: required("BUILDKITE_WEBHOOK_SECRET"),
   buildkiteAllowedOrganizations: required("BUILDKITE_ALLOWED_ORGANIZATIONS")
     .split(",").map((organization) => organization.trim().toLowerCase()).filter(Boolean),
